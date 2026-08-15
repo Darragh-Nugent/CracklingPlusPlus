@@ -440,6 +440,7 @@ int main(int argc, char** argv)
         if (groupOccurrences != 0 && calcSignatureDistance(signature, groupSignature) <= threshold)
         {
             groupOccurrences += occurrences;
+            if (groupOccurrences > 4294900) std::cout << "***********************WARNING OCCURANCES GOING OVER 32 BITS************************" << std::endl;
             std::streampos currentPos = tempSeqSignaturesOccurrences.tellp();
             tempSeqSignaturesOccurrences.seekp(groupOccurrencePos);
             tempSeqSignaturesOccurrences.write(reinterpret_cast<const char *>(&groupOccurrences), sizeof(groupOccurrences));
