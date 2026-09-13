@@ -160,12 +160,38 @@ bool seenOfftargetAlready(uint64_t* offtargetTogglesTail, uint64_t signatureId) 
     return seen;
 }
 
+uint64_t LEB128Decode(const uint8_t *ptr, uint32_t &bytesUsed)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    uint8_t byte = 0;
+    bytesUsed = 0;
+
+    do
+    {
+        byte = ptr[bytesUsed];
+        result |= static_cast<uint32_t>(byte & 0x7F) << shift;
+        shift += 7;
+        bytesUsed++;
+    } while (byte & 0x80);
+
+    return result;
+}
+
+uint64_t read40BitValue(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int b = 0; b < 5; b++)
+        v |= static_cast<uint64_t>(p[b]) << (b * 8);
+    return v;
+}
+
 int main(int argc, char** argv)
 {
     auto startLoading = std::chrono::high_resolution_clock::now();
 
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s [issltable] [query file] [max distance] [score-threshold] [score-method]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [issltable] [query file] [max distance] [score-threshold] [score-method] [use-compressed-index]\n", argv[0]);
         exit(1);
     }
 
@@ -212,6 +238,12 @@ int main(int argc, char** argv)
         fprintf(stderr, "Invalid scoring method. Acceptable options are: 'and', 'or', 'avg', 'mit', 'cfd'");
         exit(1);
     }
+
+    int compressed = 0;
+    if (argc == 7) {
+        compressed = atoi(argv[6]);
+    }
+
 
     /** Begin reading the binary encoded ISSL, structured as:
      *  - The header (3 items)
@@ -423,20 +455,67 @@ int main(int argc, char** argv)
 
                 size_t idx = sliceLimitOffset + searchSlice;
 
-                size_t signaturesInSlice = allSlicelistSizes[idx];
-                uint64_t* sigOffset = sliceListsSig[i][searchSlice];
-                uint64_t* idOccOffset = sliceListsIdOcc[i][searchSlice];
+                size_t signaturesInSlice;
+                const uint8_t* sigBase = nullptr;
+                const uint8_t* idOccBase = nullptr;
+                const uint8_t* p = nullptr;
+                uint64_t prevSignatureId = 0;
+
+                uint64_t* sigOffset = nullptr;
+                uint64_t* idOccOffset = nullptr;
+
+                if (compressed) {
+                    signaturesInSlice = allSlicelistSizes[i][searchSlice];
+
+                    const uint8_t* sliceBuf = allSliceValsPerSlice[i].data();
+                    sigBase = sliceBuf + slicelistStartOffsets[i][searchSlice] * 5;
+                    idOccBase = sliceBuf + offtargetsCount * 5 + idOccByteOffsets[i][searchSlice];
+
+                    // Walks forward through this bucket's LEB128 stream
+                    p = idOccBase;
+                } else {
+                    signaturesInSlice = allSlicelistSizes[idx];
+
+                    sigOffset = sliceListsSig[i][searchSlice];
+                    idOccOffset = sliceListsIdOcc[i][searchSlice];
+                }
+
+                alignas(64) uint64_t sigBuf[8], idBuf[8], occBuf[8];
 
                 /** For each off-target signature in slice */
                 size_t j = 0;
                 for (; j + 8 <= signaturesInSlice; j += 8) {
-                    _mm_prefetch((const char*)&sigOffset[j + 8], _MM_HINT_T0);
-                    _mm_prefetch((const char*)&idOccOffset[j + 8], _MM_HINT_T0);
+                    __m512i offTargetsVec;
+                    __m512i signatureIdVec;
+                    __m512i occurencesVec;
 
-                    __m512i offTargetsVec = _mm512_loadu_si512((__m512i*)&sigOffset[j]);
-                    __m512i idOccVec = _mm512_loadu_si512((__m512i*)&idOccOffset[j]);
-                    __m512i signatureIdVec = _mm512_and_si512(idOccVec, _mm512_set1_epi64(0xFFFFFFFFULL));
-                    __m512i occurencesVec = _mm512_srli_epi64(idOccVec, 32);
+                    if (compressed) {
+                        for (int lane = 0; lane < 8; lane++)
+                        {
+                            sigBuf[lane] = read40BitValue(sigBase + (j + lane) * 5);
+
+                            uint32_t bytesUsed = 0;
+                            uint64_t deltaId = LEB128Decode(p, bytesUsed);
+                            p += bytesUsed;
+                            prevSignatureId += deltaId;
+                            idBuf[lane] = prevSignatureId;
+
+                            occBuf[lane] = LEB128Decode(p, bytesUsed);
+                            p += bytesUsed;
+                        }
+
+                        offTargetsVec = _mm512_loadu_si512((__m512i*)sigBuf);
+                        signatureIdVec = _mm512_loadu_si512((__m512i*)idBuf);
+                        occurencesVec  = _mm512_loadu_si512((__m512i*)occBuf);
+                    } else {
+                        _mm_prefetch((const char*)&sigOffset[j + 8], _MM_HINT_T0);
+                        _mm_prefetch((const char*)&idOccOffset[j + 8], _MM_HINT_T0);
+
+                        __m512i idOccVec = _mm512_loadu_si512((__m512i*)&idOccOffset[j]);
+                        offTargetsVec = _mm512_loadu_si512((__m512i*)&sigOffset[j]);
+                        signatureIdVec = _mm512_and_si512(idOccVec, _mm512_set1_epi64(0xFFFFFFFFULL));
+                        occurencesVec = _mm512_srli_epi64(idOccVec, 32);
+                    }
 
                     __m512i xoredSignaturesVec = _mm512_xor_si512(searchSignatureVec, offTargetsVec);
                     __m512i evenBitsVec = _mm512_and_si512(xoredSignaturesVec, _mm512_set1_epi64(0xAAAAAAAAAAAAAAAAULL));
