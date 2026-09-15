@@ -5,17 +5,22 @@ import subprocess
 import time
 from pathlib import Path
 
-test_genomes_dir = Path("./test_genomes")
-RESULTS_FILE = Path("results.txt")
-
-off_target_scoring_binary = Path("../build/ISSLScoreOfftargets/ISSLScoreOfftargets").resolve()
-extract_off_targets_binary = Path("../build/ExtractOfftargets/ExtractOfftargets").resolve()
-issl_create_index_binary = Path("../build/ISSLCreateIndex/ISSLCreateIndex").resolve()
-slice_config_path = ""
+# Configurable parameters
+slice_config = "slice-8-20"
 sequence_length = "20"
 max_distance = "4"
 threshold = "0"
 score_method = "mit"
+
+SCRIPT_DIR = Path(__file__).parent
+
+test_genomes_dir = SCRIPT_DIR / "test_genomes"
+RESULTS_FILE = SCRIPT_DIR / "results.txt"
+
+off_target_scoring_binary = (SCRIPT_DIR / "../build/ISSLScoreOfftargets/ISSLScoreOfftargets").resolve()
+extract_off_targets_binary = (SCRIPT_DIR / "../build/ExtractOfftargets/ExtractOfftargets").resolve()
+issl_create_index_binary = (SCRIPT_DIR / "../build/ISSLCreateIndex/ISSLCreateIndex").resolve()
+slice_config_path = (SCRIPT_DIR / f"../sample/{slice_config}.txt")
 
 def score_off_targets(genome_folder: Path, guides: Path, number_of_guides: int | None) -> float:
     issl_index = "issl.index"
@@ -25,7 +30,6 @@ def score_off_targets(genome_folder: Path, guides: Path, number_of_guides: int |
         [off_target_scoring_binary, issl_index, guides, max_distance, threshold, score_method],
         cwd=genome_folder,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
         check=True)
     runtime = time.perf_counter() - start
     print("Scoring complete.")
@@ -38,7 +42,6 @@ def extract_off_targets(genome_folder: Path, genome_file: Path) -> None:
         [extract_off_targets_binary, output_file, genome_file],
         cwd=genome_folder,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
         check=True)
     print("Off-target extraction complete.")
 
@@ -50,7 +53,6 @@ def create_issl_index(genome_folder: Path) -> None:
         [issl_create_index_binary, off_targets, slice_config_path, sequence_length, output_file],
         cwd=genome_folder,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
         check=True)
     print("Index creation complete.")
 
