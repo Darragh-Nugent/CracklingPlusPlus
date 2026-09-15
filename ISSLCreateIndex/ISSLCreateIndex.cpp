@@ -1,6 +1,6 @@
 #include "ISSLCreateIndex.hpp"
 
-using std::vector;
+using vector;
 using std::map;
 using std::pair;
 using std::string;
@@ -14,8 +14,8 @@ using std::filesystem::file_size;
 using std::filesystem::remove;
 
 const std::regex extractNumbers("[1234567890]+");
-const std::vector<uint8_t> nucleotideIndex{ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,3 };
-const std::vector<char> signatureIndex{ 'A', 'C', 'G', 'T' };
+const vector<uint8_t> nucleotideIndex{ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,3 };
+const vector<char> signatureIndex{ 'A', 'C', 'G', 'T' };
 // 3bit
 // const vector<uint8_t> nucleotideIndex{ 1,0,2,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,7 };
 // const vector<char> signatureIndex{ '0','A','C','3','G','5','6','T' };
@@ -270,7 +270,7 @@ double calcMITLocalScore(uint64_t* mismatch_array, uint64_t length) {
  */
 double predictMITLocalScore(uint64_t xoredSignatures)
 {
-    std::vector<uint64_t> mismatch_array(20);
+    vector<uint64_t> mismatch_array(20);
     uint64_t m = 0;
     for (uint64_t j = 0; j < seqLength; j++) {
         if ((xoredSignatures >> (j * 2)) & 0x3) {
@@ -281,15 +281,112 @@ double predictMITLocalScore(uint64_t xoredSignatures)
     return calcMITLocalScore(mismatch_array.data(), m);
 }
 
+void writeRegularIndex(vector<vector<uint64_t>> &sliceMasks, uint64_t seqSignaturesCount, std::ofstream &isslIndex, char *outputFileName)
+{
+    for (size_t i = 0; i < sliceMasks.size(); i++)
+    {
+        std::cout << fmt::format("\tBuilding slice list {}", i + 1) << std::endl;
+        size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
+        vector<vector<uint64_t>> sliceListSignatures(sliceListSize);
+        vector<vector<uint64_t>> sliceListIdOccurrences(sliceListSize);
+        for (uint32_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++)
+        {
+            const uint64_t *signature = reinterpret_cast<const uint64_t *>(seqSignatures.data()) + signatureId;
+            const uint32_t *occurrences = reinterpret_cast<const uint32_t *>(seqSignaturesOccurrences.data()) + signatureId;
+            uint32_t sliceVal = 0ULL;
+            for (size_t j = 0; j < sliceMasks[i].size(); j++)
+            {
+                sliceVal |= ((*signature >> (sliceMasks[i][j] * 2)) & 3ULL) << (j * 2);
+            }
+            // seqSigIdVal represnets the sequence signature ID and number of occurrences of the associated sequence.
+            // (((uint64_t)occurrences) << 32), the most significant 32 bits is the count of the occurrences.
+            // (uint64_t)signatureId, the index of the sequence in `seqSignatures`
+            uint64_t seqSigIdVal = (static_cast<uint64_t>(*occurrences) << 32) | static_cast<uint64_t>(signatureId);
+            sliceListSignatures[sliceVal].push_back(*signature);
+            sliceListIdOccurrences[sliceVal].push_back(seqSigIdVal);
+        }
+        std::cout << "\tFinished!" << std::endl;
+
+        std::cout << fmt::format("\tWriting slice list {} to file...", i + 1) << std::endl;
+        isslIndex.open(outputFileName, std::ios::out | std::ios::binary | std::ios::app);
+        // Write slice list lengths
+        for (size_t j = 0; j < sliceListSize; j++)
+        { // Slice limit given slice width
+            size_t sz = sliceListSignatures[j].size();
+            isslIndex.write(reinterpret_cast<char *>(&sz), sizeof(size_t));
+        }
+        // write slice list off-target signatures
+        for (size_t j = 0; j < sliceListSize; j++)
+        { // Slice limit given slice width
+            isslIndex.write(reinterpret_cast<char *>(sliceListSignatures[j].data()), sizeof(uint64_t) * sliceListSignatures[j].size());
+        }
+        // write slice list (occurrences << 32 | id) values
+        for (size_t j = 0; j < sliceListSize; j++)
+        { // Slice limit given slice width
+            isslIndex.write(reinterpret_cast<char *>(sliceListIdOccurrences[j].data()), sizeof(uint64_t) * sliceListIdOccurrences[j].size());
+        }
+        isslIndex.close();
+        std::cout << "\tFinished!" << std::endl;
+    }
+}
+
+void writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks, uint64_t seqSignaturesCount, std::ofstream &isslIndex, char **argv)
+{
+    for (size_t i = 0; i < sliceMasks.size(); i++)
+    {
+        std::cout << fmt::format("\tBuilding slice list {}", i + 1) << std::endl;
+        size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
+        vector<vector<uint64_t>> sliceListSignatures(sliceListSize);
+        vector<vector<uint64_t>> sliceListIdOccurrences(sliceListSize);
+        for (uint32_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++)
+        {
+            const uint64_t *signature = reinterpret_cast<const uint64_t *>(seqSignatures.data()) + signatureId;
+            const uint32_t *occurrences = reinterpret_cast<const uint32_t *>(seqSignaturesOccurrences.data()) + signatureId;
+            uint32_t sliceVal = 0ULL;
+            for (size_t j = 0; j < sliceMasks[i].size(); j++)
+            {
+                sliceVal |= ((*signature >> (sliceMasks[i][j] * 2)) & 3ULL) << (j * 2);
+            }
+            // seqSigIdVal represnets the sequence signature ID and number of occurrences of the associated sequence.
+            // (((uint64_t)occurrences) << 32), the most significant 32 bits is the count of the occurrences.
+            // (uint64_t)signatureId, the index of the sequence in `seqSignatures`
+            uint64_t seqSigIdVal = (static_cast<uint64_t>(*occurrences) << 32) | static_cast<uint64_t>(signatureId);
+            sliceListSignatures[sliceVal].push_back(*signature);
+            sliceListIdOccurrences[sliceVal].push_back(seqSigIdVal);
+        }
+        std::cout << "\tFinished!" << std::endl;
+
+        std::cout << fmt::format("\tWriting slice list {} to file...", i + 1) << std::endl;
+        isslIndex.open(outputFileName, std::ios::out | std::ios::binary | std::ios::app);
+        // Write slice list lengths
+        for (size_t j = 0; j < sliceListSize; j++)
+        { // Slice limit given slice width
+            size_t sz = sliceListSignatures[j].size();
+            isslIndex.write(reinterpret_cast<char *>(&sz), sizeof(size_t));
+        }
+        // write slice list off-target signatures
+        for (size_t j = 0; j < sliceListSize; j++)
+        { // Slice limit given slice width
+            isslIndex.write(reinterpret_cast<char *>(sliceListSignatures[j].data()), sizeof(uint64_t) * sliceListSignatures[j].size());
+        }
+        // write slice list (occurrences << 32 | id) values
+        for (size_t j = 0; j < sliceListSize; j++)
+        { // Slice limit given slice width
+            isslIndex.write(reinterpret_cast<char *>(sliceListIdOccurrences[j].data()), sizeof(uint64_t) * sliceListIdOccurrences[j].size());
+        }
+        isslIndex.close();
+        std::cout << "\tFinished!" << std::endl;
+    }
+}
+
 int main(int argc, char** argv)
 {
     // Check number of args
-    if (argc != 5)
+    if (argc != 6)
     {
-        std::cerr << fmt::format("Usage: {} <offtarget-sites> <slice-config> <sequence-length> <output-file>\n", argv[0]) << std::endl;
+        std::cerr << fmt::format("Usage: {} <offtarget-sites> <slice-config> <sequence-length> <compressed-flag> <output-file>\n", argv[0]) << std::endl;
         exit(1);
     }
-
 
     // Check seq length 
     seqLength = atoi(argv[3]);
@@ -341,6 +438,14 @@ int main(int argc, char** argv)
         exit(1);
     }
 
+    // Check compressed flag
+    if (arg[4] != 1 || argv[4] != 0)
+    {
+        std::cerr << fmt::format("Inappropriate compression flag given. Must be 1 or 0") << std::endl;
+        exit(1);
+    }
+    bool compressionFlag = argv[4];
+
     // Read in and genereate slice masks
     ifstream scInFile;
     scInFile.open(argv[2], std::ios::in | std::ios::binary);
@@ -387,8 +492,8 @@ int main(int argc, char** argv)
 
     ofstream tempSeqSignatures;
     ofstream tempSeqSignaturesOccurrences;
-    tempSeqSignatures.open(fmt::format("{}.tmp.1", argv[4]), std::ios::out | std::ios::binary);
-    tempSeqSignaturesOccurrences.open(fmt::format("{}.tmp.2", argv[4]), std::ios::out | std::ios::binary);
+    tempSeqSignatures.open(fmt::format("{}.tmp.1", argv[5]), std::ios::out | std::ios::binary);
+    tempSeqSignaturesOccurrences.open(fmt::format("{}.tmp.2", argv[5]), std::ios::out | std::ios::binary);
 
     uint64_t progressCount = 0;
     uint64_t offtargetId = 0;
@@ -421,13 +526,13 @@ int main(int argc, char** argv)
 
     boost::iostreams::mapped_file_source seqSignatures;
     boost::iostreams::mapped_file_source seqSignaturesOccurrences;
-    seqSignatures.open(fmt::format("{}.tmp.1", argv[4]));
-    seqSignaturesOccurrences.open(fmt::format("{}.tmp.2", argv[4]));
+    seqSignatures.open(fmt::format("{}.tmp.1", argv[5]));
+    seqSignaturesOccurrences.open(fmt::format("{}.tmp.2", argv[5]));
     uint64_t seqSignaturesCount = std::distance(reinterpret_cast<const uint64_t*>(seqSignatures.begin()), reinterpret_cast<const uint64_t*>(seqSignatures.end()));
 
     std::cout << "Writing index header to file..." << std::endl;
     std::ofstream isslIndex;
-    isslIndex.open(argv[4], std::ios::out | std::ios::binary);
+    isslIndex.open(argv[5], std::ios::out | std::ios::binary);
     isslIndex.write(reinterpret_cast<char*>(&offtargetsCount), sizeof(uint64_t));
     isslIndex.write(reinterpret_cast<char*>(&seqLength), sizeof(uint64_t));
     isslIndex.write(reinterpret_cast<char*>(&sliceCount), sizeof(size_t));
@@ -443,51 +548,19 @@ int main(int argc, char** argv)
     isslIndex.close();
 
     std::cout << "Constructing index..." << std::endl;
-    for (size_t i = 0; i < sliceMasks.size(); i++)
+    if (compressionFlag)
     {
-        std::cout << fmt::format("\tBuilding slice list {}", i+1) << std::endl;
-        size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
-        vector<vector<uint64_t>> sliceListSignatures(sliceListSize);
-        vector<vector<uint64_t>> sliceListIdOccurrences(sliceListSize);
-        for (uint32_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++) {
-            const uint64_t* signature = reinterpret_cast<const uint64_t*>(seqSignatures.data()) + signatureId;
-            const uint32_t* occurrences = reinterpret_cast<const uint32_t*>(seqSignaturesOccurrences.data()) + signatureId;
-            uint32_t sliceVal = 0ULL;
-            for (size_t j = 0; j < sliceMasks[i].size(); j++)
-            {
-                sliceVal |= ((*signature >> (sliceMasks[i][j] * 2)) & 3ULL) << (j * 2);
-            }
-            // seqSigIdVal represnets the sequence signature ID and number of occurrences of the associated sequence.
-            // (((uint64_t)occurrences) << 32), the most significant 32 bits is the count of the occurrences.
-            // (uint64_t)signatureId, the index of the sequence in `seqSignatures`
-            uint64_t seqSigIdVal = (static_cast<uint64_t>(*occurrences) << 32) | static_cast<uint64_t>(signatureId);
-            sliceListSignatures[sliceVal].push_back(*signature);
-            sliceListIdOccurrences[sliceVal].push_back(seqSigIdVal);
-        }
-        std::cout << "\tFinished!" << std::endl;
-
-        std::cout << fmt::format("\tWriting slice list {} to file...", i+1) << std::endl;
-        isslIndex.open(argv[4], std::ios::out | std::ios::binary | std::ios::app);
-        // Write slice list lengths
-        for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
-            size_t sz = sliceListSignatures[j].size();
-            isslIndex.write(reinterpret_cast<char*>(&sz), sizeof(size_t));
-        }
-        // write slice list off-target signatures
-        for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
-            isslIndex.write(reinterpret_cast<char*>(sliceListSignatures[j].data()), sizeof(uint64_t) * sliceListSignatures[j].size());
-        }
-        // write slice list (occurrences << 32 | id) values
-        for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
-            isslIndex.write(reinterpret_cast<char*>(sliceListIdOccurrences[j].data()), sizeof(uint64_t) * sliceListIdOccurrences[j].size());
-        }
-        isslIndex.close();
-        std::cout << "\tFinished!" << std::endl;
+        writeCompressedIndex(sliceMasks, seqSignaturesCount, isslIndex, argv[5])
     }
+    else 
+    {
+        writeRegularIndex(sliceMasks, seqSignaturesCount, isslIndex, argv[5]);
+    }
+
     seqSignatures.close();
     seqSignaturesOccurrences.close();
-    remove(fmt::format("{}.tmp.1", argv[4]));
-    remove(fmt::format("{}.tmp.2", argv[4]));
+    remove(fmt::format("{}.tmp.1", argv[5]));
+    remove(fmt::format("{}.tmp.2", argv[5]));
 
     std::cout << "Finished!" << std::endl;
     std::cout << "Done" << std::endl;
