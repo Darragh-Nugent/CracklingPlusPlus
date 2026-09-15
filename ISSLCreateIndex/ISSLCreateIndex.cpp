@@ -1,6 +1,6 @@
 #include "ISSLCreateIndex.hpp"
 
-using vector;
+using std::vector;
 using std::map;
 using std::pair;
 using std::string;
@@ -281,7 +281,48 @@ double predictMITLocalScore(uint64_t xoredSignatures)
     return calcMITLocalScore(mismatch_array.data(), m);
 }
 
-void writeRegularIndex(vector<vector<uint64_t>> &sliceMasks, uint64_t seqSignaturesCount, std::ofstream &isslIndex, char *outputFileName)
+void LEB128Encode(uint64_t value, vector<uint8_t>& buffer)
+{
+    do {
+        uint8_t byte = value & 0x7f;
+        value >>= 7;
+        if (value != 0 ) {
+            byte |= 0x80;
+
+        }
+        buffer.push_back(byte);
+    } while (value != 0);
+}
+
+vector<uint8_t> deltaEncode(uint64_t value, vector<uint64_t> &prevValues, uint32_t sliceVal, vector<bool> &hasEntry)
+{
+    uint64_t deltaSignatureId = hasEntry[sliceVal]
+    ? value - prevValues[sliceVal]
+    : value;
+
+    hasEntry[sliceVal] = true;
+    prevValues[sliceVal] = value;
+
+    vector<uint8_t> buffer;
+    LEB128Encode(deltaSignatureId, buffer);
+
+    return buffer;
+}
+
+vector<uint8_t> write40BitValue(uint64_t value) {
+    vector<uint8_t> buffer;
+    buffer.reserve(5);
+    for (int b = 0; b < 5; b++) {
+        buffer.push_back(static_cast<uint8_t>((value >> (b * 8)) & 0xFF));
+    }
+    return buffer;
+}
+
+void writeRegularIndex(vector<vector<uint64_t>> &sliceMasks, 
+    boost::iostreams::mapped_file_source seqSignatures,  
+    boost::iostreams::mapped_file_source seqSignaturesOccurrences, 
+    uint64_t seqSignaturesCount, 
+    std::ofstream &isslIndex, char *outputFileName)
 {
     for (size_t i = 0; i < sliceMasks.size(); i++)
     {
@@ -330,50 +371,81 @@ void writeRegularIndex(vector<vector<uint64_t>> &sliceMasks, uint64_t seqSignatu
     }
 }
 
-void writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks, uint64_t seqSignaturesCount, std::ofstream &isslIndex, char **argv)
+void writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks, 
+    boost::iostreams::mapped_file_source seqSignatures,  
+    boost::iostreams::mapped_file_source seqSignaturesOccurrences, 
+    uint64_t seqSignaturesCount, 
+    std::ofstream &isslIndex, char *outputFileName)
 {
-    for (size_t i = 0; i < sliceMasks.size(); i++)
+   for (size_t i = 0; i < sliceMasks.size(); i++)
     {
-        std::cout << fmt::format("\tBuilding slice list {}", i + 1) << std::endl;
+        std::cout << fmt::format("\tBuilding slice list {}", i+1) << std::endl;
         size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
-        vector<vector<uint64_t>> sliceListSignatures(sliceListSize);
-        vector<vector<uint64_t>> sliceListIdOccurrences(sliceListSize);
-        for (uint32_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++)
-        {
-            const uint64_t *signature = reinterpret_cast<const uint64_t *>(seqSignatures.data()) + signatureId;
-            const uint32_t *occurrences = reinterpret_cast<const uint32_t *>(seqSignaturesOccurrences.data()) + signatureId;
+
+        vector<uint32_t> sliceListSizes(sliceListSize, 0);
+        vector<vector<uint8_t>> sigSliceLists(sliceListSize);
+        vector<vector<uint8_t>> sigIdOccSliceLists(sliceListSize);
+        
+        vector<uint64_t> prevSignatures(sliceListSize, 0);
+        vector<uint64_t> prevSignatureIds(sliceListSize, 0);
+
+        vector<bool> bucketHasSignature(sliceListSize, false);
+        vector<bool> bucketHasSignatreID(sliceListSize, false);
+
+        for (uint32_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++) {
+            const uint64_t* signature = reinterpret_cast<const uint64_t*>(seqSignatures.data()) + signatureId;
+            const uint32_t* occurrences = reinterpret_cast<const uint32_t*>(seqSignaturesOccurrences.data()) + signatureId;
             uint32_t sliceVal = 0ULL;
             for (size_t j = 0; j < sliceMasks[i].size(); j++)
             {
                 sliceVal |= ((*signature >> (sliceMasks[i][j] * 2)) & 3ULL) << (j * 2);
             }
-            // seqSigIdVal represnets the sequence signature ID and number of occurrences of the associated sequence.
-            // (((uint64_t)occurrences) << 32), the most significant 32 bits is the count of the occurrences.
-            // (uint64_t)signatureId, the index of the sequence in `seqSignatures`
-            uint64_t seqSigIdVal = (static_cast<uint64_t>(*occurrences) << 32) | static_cast<uint64_t>(signatureId);
-            sliceListSignatures[sliceVal].push_back(*signature);
-            sliceListIdOccurrences[sliceVal].push_back(seqSigIdVal);
+
+            // Compress signatures to fit within 40 bit values
+            vector<uint8_t> encoded40BitSignature = write40BitValue(*signature);
+            // Use delta compression and LEB128 encoding on signature IDs
+            vector<uint8_t> LEB128DeltaSignatureId = deltaEncode(static_cast<uint64_t>(signatureId), prevSignatureIds, sliceVal, bucketHasSignatreID);
+            // Occurences is not sorted so only use LEB128 Encoding
+            vector<uint8_t> LEB128Occurance;
+            LEB128Encode(*occurrences, LEB128Occurance);
+
+            sigSliceLists[sliceVal].insert(sigSliceLists[sliceVal].end(), encoded40BitSignature.begin(), encoded40BitSignature.end());
+            sigIdOccSliceLists[sliceVal].insert(sigIdOccSliceLists[sliceVal].end(), LEB128DeltaSignatureId.begin(), LEB128DeltaSignatureId.end());
+            sigIdOccSliceLists[sliceVal].insert( sigIdOccSliceLists[sliceVal].end(), LEB128Occurance.begin(), LEB128Occurance.end());
+
+            sliceListSizes[sliceVal]++;
         }
         std::cout << "\tFinished!" << std::endl;
 
-        std::cout << fmt::format("\tWriting slice list {} to file...", i + 1) << std::endl;
+        std::cout << fmt::format("\tWriting slice list {} to file...", i+1) << std::endl;
         isslIndex.open(outputFileName, std::ios::out | std::ios::binary | std::ios::app);
-        // Write slice list lengths
-        for (size_t j = 0; j < sliceListSize; j++)
-        { // Slice limit given slice width
-            size_t sz = sliceListSignatures[j].size();
-            isslIndex.write(reinterpret_cast<char *>(&sz), sizeof(size_t));
+
+        // Write slice list counts
+        for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
+            size_t sz = sliceListSizes[j];
+            isslIndex.write(reinterpret_cast<char*>(&sz), sizeof(size_t));
         }
-        // write slice list off-target signatures
-        for (size_t j = 0; j < sliceListSize; j++)
-        { // Slice limit given slice width
-            isslIndex.write(reinterpret_cast<char *>(sliceListSignatures[j].data()), sizeof(uint64_t) * sliceListSignatures[j].size());
+
+        // Write slice list byte counts
+        size_t totalSliceLength = 0;
+        for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
+            size_t sz = sigIdOccSliceLists[j].size();
+            totalSliceLength += sigSliceLists[j].size() + sz;
+            isslIndex.write(reinterpret_cast<char*>(&sz), sizeof(size_t));
         }
-        // write slice list (occurrences << 32 | id) values
-        for (size_t j = 0; j < sliceListSize; j++)
-        { // Slice limit given slice width
-            isslIndex.write(reinterpret_cast<char *>(sliceListIdOccurrences[j].data()), sizeof(uint64_t) * sliceListIdOccurrences[j].size());
+
+        // Write total slice list byte length
+        isslIndex.write(reinterpret_cast<char*>(&totalSliceLength), sizeof(size_t));
+
+        // write signatures
+        for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
+            isslIndex.write(reinterpret_cast<char*>(sigSliceLists[j].data()), sigSliceLists[j].size());
+        }       
+        // write signatureIDs + occurences
+        for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
+            isslIndex.write(reinterpret_cast<char*>(sigIdOccSliceLists[j].data()), sigIdOccSliceLists[j].size());
         }
+
         isslIndex.close();
         std::cout << "\tFinished!" << std::endl;
     }
@@ -439,7 +511,7 @@ int main(int argc, char** argv)
     }
 
     // Check compressed flag
-    if (arg[4] != 1 || argv[4] != 0)
+    if (atoi(argv[4]) != 1 || atoi(argv[4]) != 0)
     {
         std::cerr << fmt::format("Inappropriate compression flag given. Must be 1 or 0") << std::endl;
         exit(1);
@@ -550,11 +622,11 @@ int main(int argc, char** argv)
     std::cout << "Constructing index..." << std::endl;
     if (compressionFlag)
     {
-        writeCompressedIndex(sliceMasks, seqSignaturesCount, isslIndex, argv[5])
+        writeCompressedIndex(sliceMasks, seqSignatures, seqSignaturesOccurrences, seqSignaturesCount, isslIndex, argv[5]);
     }
     else 
     {
-        writeRegularIndex(sliceMasks, seqSignaturesCount, isslIndex, argv[5]);
+        writeRegularIndex(sliceMasks, seqSignatures, seqSignaturesOccurrences, seqSignaturesCount, isslIndex, argv[5]);
     }
 
     seqSignatures.close();
