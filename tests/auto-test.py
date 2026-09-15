@@ -47,7 +47,7 @@ def extract_off_targets(genome_folder: Path, genome_file: Path) -> None:
 
 def create_issl_index(genome_folder: Path) -> None:
     off_targets = "off_targets.txt"
-    output_file = "issl.index"
+    output_file = "index.issl"
     print(f"Creating index for {genome_folder.name}")
     subprocess.run(
         [issl_create_index_binary, off_targets, slice_config_path, sequence_length, output_file],
@@ -89,8 +89,15 @@ for genome_folder in test_genomes_dir.iterdir():
     genome_name = genome_folder.name
     genome_file = list(genome_folder.glob("*.fna"))[0] # assume only one .fna file per genome dir
 
-    extract_off_targets(genome_folder, genome_file)
-    create_issl_index(genome_folder)
+    if all(file.name != "off_targets.txt" for file in genome_folder.glob("*.txt")):
+        extract_off_targets(genome_folder, genome_file)
+    else:
+        print("off_targets.txt file detected... skipping off-target extraction")
+
+    if all(file.name != "index.issl" for file in genome_folder.glob("*.issl")):
+        create_issl_index(genome_folder)
+    else:
+        print("index.issl file detected... skipping ISSL index creation")
 
     for guides in list(genome_folder.glob("*.txt")) + list(genome_folder.glob("*.fa")):
         if guides.name == "off_targets.txt":
