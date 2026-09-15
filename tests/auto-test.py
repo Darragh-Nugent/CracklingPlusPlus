@@ -24,7 +24,8 @@ slice_config_path = (SCRIPT_DIR / f"../sample/{slice_config}.txt")
 
 def score_off_targets(genome_folder: Path, guides: Path, number_of_guides: int | None) -> float:
     issl_index = "issl.index"
-    print(f"Scoring {genome_folder.name} against {number_of_guides if number_of_guides is not None else "UNKNOWN"} guides...")
+    guide_count = number_of_guides if number_of_guides is not None else "UNKNOWN"
+    print(f"Scoring {genome_folder.name} against {guide_count} guides...")
     start = time.perf_counter()
     subprocess.run(
         [off_target_scoring_binary, issl_index, guides, max_distance, threshold, score_method],
