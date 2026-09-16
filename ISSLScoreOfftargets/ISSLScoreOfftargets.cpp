@@ -170,7 +170,7 @@ uint64_t LEB128Decode(const uint8_t *ptr, uint32_t &bytesUsed)
     do
     {
         byte = ptr[bytesUsed];
-        result |= static_cast<uint32_t>(byte & 0x7F) << shift;
+        result |= static_cast<uint64_t>(byte & 0x7F) << shift;
         shift += 7;
         bytesUsed++;
     } while (byte & 0x80);
@@ -303,28 +303,152 @@ int main(int argc, char** argv)
 
     /** The number of signatures embedded per slice. Store continguously */
     vector<size_t> allSlicelistSizes(sliceListCount);
+    vector<size_t> allSlicelistByteCounts;
+    vector<uint8_t> allSignatureVals;
+    vector<uint8_t> allIdOccurrences;
+    vector<vector<uint8_t*>> sliceListsSig(sliceCount);
+    vector<vector<uint8_t*>> sliceListsIdOcc(sliceCount);
 
-    vector<uint64_t> allSignatureVals(offtargetsCount * sliceCount);
+    if (compressed)
+    {
+        allSlicelistByteCounts.resize(sliceListCount);
+        vector<size_t> allTotalSlicelistByteCounts(sliceCount);
+        allSignatureVals.resize(offtargetsCount * sliceCount * 5);
 
-    vector<uint64_t> allIdOccurrences(offtargetsCount * sliceCount);
+        uint64_t totalByteCount;
+        if (fread(&totalByteCount, sizeof(uint64_t), 1, isslFp) == 0) {
+            throw std::runtime_error("Error reading header: Cannot find total byte count\n");
+        }
 
-    sliceListCount = 0;
+        allIdOccurrences.resize(totalByteCount);
+
+        sliceListCount = 0;
+        uint8_t* idOccurrencesPtr = allIdOccurrences.data();
+        for (size_t i = 0; i < sliceCount; i++)
+        {
+            size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
+
+            if (fread(allSlicelistSizes.data() + sliceListCount, sizeof(size_t), sliceListSize, isslFp) == 0)
+            {
+                throw std::runtime_error("Error reading index: reading slice list sizes failed\n");
+            }
+
+            if (fread(allSlicelistByteCounts.data() + sliceListCount, sizeof(size_t), sliceListSize, isslFp) == 0)
+            {
+                throw std::runtime_error("Error reading index: reading slice list byte counts failed\n");
+            }
+
+            if (fread(&allTotalSlicelistByteCounts[i], sizeof(size_t), 1, isslFp) == 0)
+            {
+                throw std::runtime_error("Error reading index: reading total slice list byte count failed\n");
+            }
+
+            if (fread(allSignatureVals.data() + (offtargetsCount * i * 5), sizeof(uint8_t), offtargetsCount * 5, isslFp) == 0)
+            {
+                throw std::runtime_error("Error reading index: reading signature values failed\n");
+            }
+
+            if (fread(idOccurrencesPtr, sizeof(uint8_t), allTotalSlicelistByteCounts[i], isslFp) == 0)
+            {
+                throw std::runtime_error("Error reading index: reading slice values failed\n");
+            }
+            idOccurrencesPtr += allTotalSlicelistByteCounts[i];
+            
+            sliceListCount += sliceListSize;
+        }
+    }
+    else
+    {
+        allSignatureVals.resize(offtargetsCount * sliceCount * sizeof(uint64_t));
+        allIdOccurrences.resize(offtargetsCount * sliceCount * sizeof(uint64_t));
+
+        sliceListCount = 0;
+        for (size_t i = 0; i < sliceCount; i++)
+        {
+            size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
+            if (fread(allSlicelistSizes.data() + sliceListCount, sizeof(size_t), sliceListSize, isslFp) == 0) {
+                throw std::runtime_error("Error reading index: reading slice list sizes failed\n");
+            }
+
+            if (fread(allSignatureVals.data() + (offtargetsCount * i * sizeof(uint64_t)), sizeof(uint64_t), offtargetsCount, isslFp) == 0) {
+                throw std::runtime_error("Error reading index: reading slice off-target signatures failed\n");
+            }
+
+            if (fread(allIdOccurrences.data() + (offtargetsCount * i * sizeof(uint64_t)), sizeof(uint64_t), offtargetsCount, isslFp) == 0) {
+                throw std::runtime_error("Error reading index: reading slice id/occurrence data failed\n");
+            }
+
+            sliceListCount += sliceListSize;
+        }
+    }
+
+    /** Start constructing index in memory
+     *
+     *      To begin, reverse the contiguous storage of the slices,
+     *         into the following:
+     *      
+     *      For the compressed index:
+     *
+     *         + Slice 0 :
+     *         |---- AAAA : <signature1>
+     *         |---- AAAC : <signature2>
+     *         |----  ...
+     *         |---- AAAA : <signatureId1><occurences1>
+     *         |---- AAAC : <signatureId2><occurences2>
+     *         |
+     *         + Slice 2 :
+     *         |---- AAAA : <signature1>
+     *         |---- AAAC : <signature2>
+     *         |----  ...
+     *         |---- AAAA : <signatureId1><occurences1>
+     *         |---- AAAC : <signatureId2><occurences2>
+     *         |
+     *
+     *      For the non-compressed index:
+     *
+     *         + Slice 0 :
+     *         |---- AAAA : <slice contents>
+     *         |---- AAAC : <slice contents>
+     *         |----  ...
+     *         |
+     *         + Slice 1 :
+     *         |---- AAAA : <slice contents>
+     *         |---- AAAC : <slice contents>
+     *         |---- ...
+     *         | ...
+     */
+
+    // vector<vector<uint64_t*>> sliceListsSig(sliceCount);
+    // vector<vector<uint64_t*>> sliceListsIdOcc(sliceCount);
+    // Assign sliceLists size based on each slice length
     for (size_t i = 0; i < sliceCount; i++)
     {
-        size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
-        if (fread(allSlicelistSizes.data() + sliceListCount, sizeof(size_t), sliceListSize, isslFp) == 0) {
-            throw std::runtime_error("Error reading index: reading slice list sizes failed\n");
-        }
+        sliceListsSig[i] = vector<uint8_t*>(1ULL << (sliceMasks[i].size() * 2));
+        sliceListsIdOcc[i] = vector<uint8_t*>(1ULL << (sliceMasks[i].size() * 2));
+    }
 
-        if (fread(allSignatureVals.data() + (offtargetsCount * i), sizeof(uint64_t), offtargetsCount, isslFp) == 0) {
-            throw std::runtime_error("Error reading index: reading slice off-target signatures failed\n");
-        }
+    uint8_t* sigOffsetPtr = allSignatureVals.data();
+    uint8_t* idOccOffsetPtr = allIdOccurrences.data();
+    size_t sliceLimitOffset = 0;
+    for (size_t i = 0; i < sliceCount; i++) {
+        size_t sliceLimit = 1ULL << (sliceMasks[i].size() * 2);
+        for (size_t j = 0; j < sliceLimit; j++) {
+            size_t idx = sliceLimitOffset + j;
+            sliceListsSig[i][j] = sigOffsetPtr;
+            sliceListsIdOcc[i][j] = idOccOffsetPtr;
 
-        if (fread(allIdOccurrences.data() + (offtargetsCount * i), sizeof(uint64_t), offtargetsCount, isslFp) == 0) {
-            throw std::runtime_error("Error reading index: reading slice id/occurrence data failed\n");
+            if (compressed)
+            {
+                sigOffsetPtr += allSlicelistSizes[idx] * 5;
+                idOccOffsetPtr += allSlicelistByteCounts[idx];
+            }
+            else
+            {
+                sigOffsetPtr += allSlicelistSizes[idx] * sizeof(uint64_t);
+                idOccOffsetPtr += allSlicelistSizes[idx] * sizeof(uint64_t);
+            }
         }
-
-        sliceListCount += sliceListSize;
+        sliceLimitOffset += sliceLimit;
     }
 
     /** End reading the index */
@@ -341,47 +465,6 @@ int main(int argc, char** argv)
      *      The CHAR_BIT macro tells us how many bits are in a byte (C++ >= 8 bits per byte)
      */
     uint64_t numOfftargetToggles = (offtargetsCount / ((size_t)sizeof(uint64_t) * (size_t)CHAR_BIT)) + 1;
-
-    /** Start constructing index in memory
-     *
-     *      To begin, reverse the contiguous storage of the slices,
-     *         into the following:
-     *
-     *         + Slice 0 :
-     *         |---- AAAA : <slice contents>
-     *         |---- AAAC : <slice contents>
-     *         |----  ...
-     *         |
-     *         + Slice 1 :
-     *         |---- AAAA : <slice contents>
-     *         |---- AAAC : <slice contents>
-     *         |---- ...
-     *         | ...
-     */
-
-    vector<vector<uint64_t*>> sliceListsSig(sliceCount);
-    vector<vector<uint64_t*>> sliceListsIdOcc(sliceCount);
-    // Assign sliceLists size based on each slice length
-    for (size_t i = 0; i < sliceCount; i++)
-    {
-        sliceListsSig[i] = vector<uint64_t*>(1ULL << (sliceMasks[i].size() * 2));
-        sliceListsIdOcc[i] = vector<uint64_t*>(1ULL << (sliceMasks[i].size() * 2));
-    }
-
-    uint64_t* sigOffsetPtr = allSignatureVals.data();
-    uint64_t* idOccOffsetPtr = allIdOccurrences.data();
-    size_t sliceLimitOffset = 0;
-    for (size_t i = 0; i < sliceCount; i++) {
-        size_t sliceLimit = 1ULL << (sliceMasks[i].size() * 2);
-        for (size_t j = 0; j < sliceLimit; j++) {
-            size_t idx = sliceLimitOffset + j;
-            sliceListsSig[i][j] = sigOffsetPtr;
-            sliceListsIdOcc[i][j] = idOccOffsetPtr;
-            sigOffsetPtr += allSlicelistSizes[idx];
-            idOccOffsetPtr += allSlicelistSizes[idx];
-        }
-        sliceLimitOffset += sliceLimit;
-    }
 
     auto endLoading = std::chrono::high_resolution_clock::now();
     auto startProcessing = std::chrono::high_resolution_clock::now();
@@ -456,29 +539,17 @@ int main(int argc, char** argv)
                 size_t idx = sliceLimitOffset + searchSlice;
 
                 size_t signaturesInSlice;
-                const uint8_t* sigBase = nullptr;
-                const uint8_t* idOccBase = nullptr;
                 const uint8_t* p = nullptr;
                 uint64_t prevSignatureId = 0;
 
-                uint64_t* sigOffset = nullptr;
-                uint64_t* idOccOffset = nullptr;
+                uint8_t* sigOffset = nullptr;
+                uint8_t* idOccOffset = nullptr;
 
-                if (compressed) {
-                    signaturesInSlice = allSlicelistSizes[i][searchSlice];
+                signaturesInSlice = allSlicelistSizes[idx];
+                sigOffset = sliceListsSig[i][searchSlice];
+                idOccOffset = sliceListsIdOcc[i][searchSlice];
 
-                    const uint8_t* sliceBuf = allSliceValsPerSlice[i].data();
-                    sigBase = sliceBuf + slicelistStartOffsets[i][searchSlice] * 5;
-                    idOccBase = sliceBuf + offtargetsCount * 5 + idOccByteOffsets[i][searchSlice];
-
-                    // Walks forward through this bucket's LEB128 stream
-                    p = idOccBase;
-                } else {
-                    signaturesInSlice = allSlicelistSizes[idx];
-
-                    sigOffset = sliceListsSig[i][searchSlice];
-                    idOccOffset = sliceListsIdOcc[i][searchSlice];
-                }
+                p = idOccOffset;
 
                 alignas(64) uint64_t sigBuf[8], idBuf[8], occBuf[8];
 
@@ -492,7 +563,7 @@ int main(int argc, char** argv)
                     if (compressed) {
                         for (int lane = 0; lane < 8; lane++)
                         {
-                            sigBuf[lane] = read40BitValue(sigBase + (j + lane) * 5);
+                            sigBuf[lane] = read40BitValue(sigOffset + (j + lane) * 5);
 
                             uint32_t bytesUsed = 0;
                             uint64_t deltaId = LEB128Decode(p, bytesUsed);
@@ -508,11 +579,14 @@ int main(int argc, char** argv)
                         signatureIdVec = _mm512_loadu_si512((__m512i*)idBuf);
                         occurencesVec  = _mm512_loadu_si512((__m512i*)occBuf);
                     } else {
-                        _mm_prefetch((const char*)&sigOffset[j + 8], _MM_HINT_T0);
-                        _mm_prefetch((const char*)&idOccOffset[j + 8], _MM_HINT_T0);
+                        uint64_t* sigOffset64 = reinterpret_cast<uint64_t*>(sigOffset);
+                        uint64_t* idOccOffset64 = reinterpret_cast<uint64_t*>(idOccOffset);
 
-                        __m512i idOccVec = _mm512_loadu_si512((__m512i*)&idOccOffset[j]);
-                        offTargetsVec = _mm512_loadu_si512((__m512i*)&sigOffset[j]);
+                        _mm_prefetch((const char*)&sigOffset64[j + 8], _MM_HINT_T0);
+                        _mm_prefetch((const char*)&idOccOffset64[j + 8], _MM_HINT_T0);
+
+                        __m512i idOccVec = _mm512_loadu_si512((__m512i*)&idOccOffset64[j]);
+                        offTargetsVec = _mm512_loadu_si512((__m512i*)&sigOffset64[j]);
                         signatureIdVec = _mm512_and_si512(idOccVec, _mm512_set1_epi64(0xFFFFFFFFULL));
                         occurencesVec = _mm512_srli_epi64(idOccVec, 32);
                     }
@@ -525,18 +599,36 @@ int main(int argc, char** argv)
 
                     alignas(64) uint64_t mismatchesArr[8];
                     alignas(64) uint64_t distArr[8];
+                    alignas(64) uint64_t offTargetArr[8];
+                    alignas(64) uint64_t sigIdArr[8];
+                    alignas(64) uint64_t occArr[8];
 
                     _mm512_store_si512((__m512i *)mismatchesArr, mismatchesVec);
                     _mm512_store_si512((__m512i *)distArr, distVec);
+
+                    if (!compressed) {
+                        _mm512_store_si512((__m512i*)offTargetArr, offTargetsVec);
+                        _mm512_store_si512((__m512i*)sigIdArr, signatureIdVec);
+                        _mm512_store_si512((__m512i*)occArr, occurencesVec);
+                    }
 
                     for (int lane = 0; lane < 8; lane++) {
                         uint64_t dist = distArr[lane];
                         uint64_t mismatches = mismatchesArr[lane];
 
-                        uint64_t offTargetSignature = sigOffset[j + lane];
-                        uint64_t idOccVal = idOccOffset[j + lane];
-                        uint64_t signatureId = idOccVal & 0xFFFFFFFFULL;
-                        uint32_t occurrences = (uint32_t)(idOccVal >> 32);
+                        uint64_t offTargetSignature;
+                        uint64_t signatureId;
+                        uint32_t occurrences;
+
+                        if (compressed) {
+                            offTargetSignature = sigBuf[lane];
+                            signatureId = idBuf[lane];
+                            occurrences = (uint32_t)occBuf[lane];
+                        } else {
+                            offTargetSignature = offTargetArr[lane];
+                            signatureId = sigIdArr[lane];
+                            occurrences = (uint32_t)occArr[lane];
+                        }
 
                         if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
 
@@ -547,10 +639,30 @@ int main(int argc, char** argv)
                 }
                 // Clean-up loop
                 for (; j < signaturesInSlice && checkNextOfftargets; j++) {
-                    uint64_t offTargetSignature = sigOffset[j];
-                    uint64_t idOccVal = idOccOffset[j];
-                    uint64_t signatureId = idOccVal & 0xFFFFFFFFULL;
-                    uint32_t occurrences = (uint32_t)(idOccVal >> 32);
+                    uint64_t offTargetSignature;
+                    uint64_t signatureId;
+                    uint32_t occurrences;
+
+                    if (compressed) {
+                        offTargetSignature = read40BitValue(sigOffset + j * 5);
+
+                        uint32_t bytesUsed = 0;
+                        uint64_t deltaId = LEB128Decode(p, bytesUsed);
+                        p += bytesUsed;
+                        prevSignatureId += deltaId;
+                        signatureId = prevSignatureId;
+
+                        occurrences = (uint32_t)LEB128Decode(p, bytesUsed);
+                        p += bytesUsed;
+                    } else {
+                        uint64_t* sigOffset64 = reinterpret_cast<uint64_t*>(sigOffset);
+                        uint64_t* idOccOffset64 = reinterpret_cast<uint64_t*>(idOccOffset);
+
+                        offTargetSignature = sigOffset64[j];
+                        uint64_t idOccVal = idOccOffset64[j];
+                        signatureId = idOccVal & 0xFFFFFFFFULL;
+                        occurrences = (uint32_t)(idOccVal >> 32);
+                    }
 
                     if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
 

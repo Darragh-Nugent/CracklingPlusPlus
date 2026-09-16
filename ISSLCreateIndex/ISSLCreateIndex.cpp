@@ -371,13 +371,14 @@ void writeRegularIndex(vector<vector<uint64_t>> &sliceMasks,
     }
 }
 
-void writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks, 
+uint64_t writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks, 
     boost::iostreams::mapped_file_source seqSignatures,  
     boost::iostreams::mapped_file_source seqSignaturesOccurrences, 
     uint64_t seqSignaturesCount, 
     std::ofstream &isslIndex, char *outputFileName)
 {
-   for (size_t i = 0; i < sliceMasks.size(); i++)
+    uint64_t totalByteCount = 0;
+    for (size_t i = 0; i < sliceMasks.size(); i++)
     {
         std::cout << fmt::format("\tBuilding slice list {}", i+1) << std::endl;
         size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
@@ -386,10 +387,8 @@ void writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks,
         vector<vector<uint8_t>> sigSliceLists(sliceListSize);
         vector<vector<uint8_t>> sigIdOccSliceLists(sliceListSize);
         
-        vector<uint64_t> prevSignatures(sliceListSize, 0);
         vector<uint64_t> prevSignatureIds(sliceListSize, 0);
 
-        vector<bool> bucketHasSignature(sliceListSize, false);
         vector<bool> bucketHasSignatreID(sliceListSize, false);
 
         for (uint32_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++) {
@@ -419,7 +418,7 @@ void writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks,
 
         std::cout << fmt::format("\tWriting slice list {} to file...", i+1) << std::endl;
         isslIndex.open(outputFileName, std::ios::out | std::ios::binary | std::ios::app);
-
+        
         // Write slice list counts
         for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
             size_t sz = sliceListSizes[j];
@@ -430,12 +429,13 @@ void writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks,
         size_t totalSliceLength = 0;
         for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
             size_t sz = sigIdOccSliceLists[j].size();
-            totalSliceLength += sigSliceLists[j].size() + sz;
+            totalSliceLength += sz;
             isslIndex.write(reinterpret_cast<char*>(&sz), sizeof(size_t));
         }
 
         // Write total slice list byte length
         isslIndex.write(reinterpret_cast<char*>(&totalSliceLength), sizeof(size_t));
+        totalByteCount += totalSliceLength;
 
         // write signatures
         for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
@@ -449,6 +449,8 @@ void writeCompressedIndex(vector<vector<uint64_t>> &sliceMasks,
         isslIndex.close();
         std::cout << "\tFinished!" << std::endl;
     }
+
+    return totalByteCount;
 }
 
 int main(int argc, char** argv)
@@ -511,12 +513,12 @@ int main(int argc, char** argv)
     }
 
     // Check compressed flag
-    if (atoi(argv[4]) != 1 || atoi(argv[4]) != 0)
+    if (atoi(argv[4]) != 1 && atoi(argv[4]) != 0)
     {
         std::cerr << fmt::format("Inappropriate compression flag given. Must be 1 or 0") << std::endl;
         exit(1);
     }
-    bool compressionFlag = argv[4];
+    bool compressionFlag = argv[4] != 0;
 
     // Read in and genereate slice masks
     ifstream scInFile;
@@ -617,12 +619,25 @@ int main(int argc, char** argv)
     }
     std::cout << "Finished!" << std::endl;
 
+    std::streampos totalPlaceholderPos = isslIndex.tellp();
+    if (compressionFlag)
+    {
+        // Reserve a spot for the total byte count
+        const uint64_t placeholder = 0;
+        isslIndex.write(reinterpret_cast<const char*>(&placeholder), sizeof(placeholder));
+    }
+
     isslIndex.close();
 
     std::cout << "Constructing index..." << std::endl;
     if (compressionFlag)
     {
-        writeCompressedIndex(sliceMasks, seqSignatures, seqSignaturesOccurrences, seqSignaturesCount, isslIndex, argv[5]);
+        uint64_t totalIdOccBytes = writeCompressedIndex(sliceMasks, seqSignatures, seqSignaturesOccurrences, seqSignaturesCount, isslIndex, argv[5]);
+        std::cout << "Writing total bytes for signature ID and occurrences section..." << std::endl;
+        isslIndex.open(argv[5], std::ios::in |std::ios::out | std::ios::binary);
+        isslIndex.seekp(totalPlaceholderPos);
+        isslIndex.write(reinterpret_cast<char*>(&totalIdOccBytes), sizeof(uint64_t));
+        isslIndex.close();
     }
     else 
     {
