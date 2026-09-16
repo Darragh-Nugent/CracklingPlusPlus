@@ -11,6 +11,7 @@ sequence_length = "20"
 max_distance = "4"
 threshold = "0"
 score_method = "mit"
+count_of_guides = [10000]
 
 SCRIPT_DIR = Path(__file__).parent
 
@@ -57,6 +58,14 @@ def create_issl_index(genome_folder: Path) -> None:
         check=True)
     print("Index creation complete.")
 
+def generate_guides(genome_folder: Path, number_of_guides: int):
+    subprocess.run(
+        f"shuf -n {number_of_guides} off_targets.txt > guides_{number_of_guides}.txt",
+        cwd=genome_folder,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        check=True)
+
 def count_lines(file: Path) -> int:
     result = subprocess.run(
         ["wc", "-l", str(file)],
@@ -99,6 +108,12 @@ for genome_folder in test_genomes_dir.iterdir():
         create_issl_index(genome_folder)
     else:
         print("index.issl file detected... skipping ISSL index creation")
+
+    for guides_size in count_of_guides:
+        if all(file.name != f"guides_{guides_size}.txt" for file in genome_folder.glob("*.txt")):
+            generate_guides(genome_folder, guides_size)
+        else:
+            print(f"guides_{guides_size}.txt detected... skipping creating guides.")
 
     for guides in list(genome_folder.glob("*.txt")) + list(genome_folder.glob("*.fa")):
         if guides.name == "off_targets.txt":
