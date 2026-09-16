@@ -518,7 +518,11 @@ int main(int argc, char** argv)
         std::cerr << fmt::format("Inappropriate compression flag given. Must be 1 or 0") << std::endl;
         exit(1);
     }
-    bool compressionFlag = argv[4] != 0;
+    bool compressionFlag = (atoi(argv[4]) != 0);    
+    if (compressionFlag)
+    {
+        std::cout << "Generating compressed index..." << std::endl;
+    }
 
     // Read in and genereate slice masks
     ifstream scInFile;
