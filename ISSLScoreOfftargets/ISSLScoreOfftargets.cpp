@@ -244,12 +244,6 @@ int main(int argc, char** argv)
     size_t seqLength = slicelistHeader[1];
     size_t sliceCount = slicelistHeader[2];
 
-    /** Load in all of the off-target sites */
-    vector<uint64_t> offtargets(offtargetsCount);
-    if (fread(offtargets.data(), sizeof(uint64_t), offtargetsCount, isslFp) == 0) {
-        throw std::runtime_error("Error reading index: reading off-target sites failed\n");
-    }
-
     /** Read the slice masks and generate 2 bit masks */
     vector<vector<uint64_t>> sliceMasks;
     for (size_t i = 0; i < sliceCount; i++)
@@ -278,9 +272,8 @@ int main(int argc, char** argv)
     /** The number of signatures embedded per slice. Store continguously */
     vector<size_t> allSlicelistSizes(sliceListCount);
 
-    /** The contents of the slices: only the id/occurrence values,
-     *      the off-target signatures themselves are looked up in `offtargets` by id
-     */
+    vector<uint64_t> allSignatureVals(offtargetsCount * sliceCount);
+
     vector<uint64_t> allIdOccurrences(offtargetsCount * sliceCount);
 
     sliceListCount = 0;
@@ -289,6 +282,10 @@ int main(int argc, char** argv)
         size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
         if (fread(allSlicelistSizes.data() + sliceListCount, sizeof(size_t), sliceListSize, isslFp) == 0) {
             throw std::runtime_error("Error reading index: reading slice list sizes failed\n");
+        }
+
+        if (fread(allSignatureVals.data() + (offtargetsCount * i), sizeof(uint64_t), offtargetsCount, isslFp) == 0) {
+            throw std::runtime_error("Error reading index: reading slice off-target signatures failed\n");
         }
 
         if (fread(allIdOccurrences.data() + (offtargetsCount * i), sizeof(uint64_t), offtargetsCount, isslFp) == 0) {
@@ -330,20 +327,25 @@ int main(int argc, char** argv)
      *         | ...
      */
 
+    vector<vector<uint64_t*>> sliceListsSig(sliceCount);
     vector<vector<uint64_t*>> sliceListsIdOcc(sliceCount);
     // Assign sliceLists size based on each slice length
     for (size_t i = 0; i < sliceCount; i++)
     {
+        sliceListsSig[i] = vector<uint64_t*>(1ULL << (sliceMasks[i].size() * 2));
         sliceListsIdOcc[i] = vector<uint64_t*>(1ULL << (sliceMasks[i].size() * 2));
     }
 
+    uint64_t* sigOffsetPtr = allSignatureVals.data();
     uint64_t* idOccOffsetPtr = allIdOccurrences.data();
     size_t sliceLimitOffset = 0;
     for (size_t i = 0; i < sliceCount; i++) {
         size_t sliceLimit = 1ULL << (sliceMasks[i].size() * 2);
         for (size_t j = 0; j < sliceLimit; j++) {
             size_t idx = sliceLimitOffset + j;
+            sliceListsSig[i][j] = sigOffsetPtr;
             sliceListsIdOcc[i][j] = idOccOffsetPtr;
+            sigOffsetPtr += allSlicelistSizes[idx];
             idOccOffsetPtr += allSlicelistSizes[idx];
         }
         sliceLimitOffset += sliceLimit;
@@ -422,17 +424,19 @@ int main(int argc, char** argv)
                 size_t idx = sliceLimitOffset + searchSlice;
 
                 size_t signaturesInSlice = allSlicelistSizes[idx];
+                uint64_t* sigOffset = sliceListsSig[i][searchSlice];
                 uint64_t* idOccOffset = sliceListsIdOcc[i][searchSlice];
 
                 /** For each off-target signature in slice */
                 size_t j = 0;
                 for (; j + 8 <= signaturesInSlice; j += 8) {
+                    _mm_prefetch((const char*)&sigOffset[j + 8], _MM_HINT_T0);
                     _mm_prefetch((const char*)&idOccOffset[j + 8], _MM_HINT_T0);
 
+                    __m512i offTargetsVec = _mm512_loadu_si512((__m512i*)&sigOffset[j]);
                     __m512i idOccVec = _mm512_loadu_si512((__m512i*)&idOccOffset[j]);
                     __m512i signatureIdVec = _mm512_and_si512(idOccVec, _mm512_set1_epi64(0xFFFFFFFFULL));
                     __m512i occurencesVec = _mm512_srli_epi64(idOccVec, 32);
-                    __m512i offTargetsVec = _mm512_i64gather_epi64(signatureIdVec, (const long long*)offtargets.data(), 8);
 
                     __m512i xoredSignaturesVec = _mm512_xor_si512(searchSignatureVec, offTargetsVec);
                     __m512i evenBitsVec = _mm512_and_si512(xoredSignaturesVec, _mm512_set1_epi64(0xAAAAAAAAAAAAAAAAULL));
@@ -440,20 +444,20 @@ int main(int argc, char** argv)
                     __m512i mismatchesVec = _mm512_or_si512(_mm512_srli_epi64(evenBitsVec, 1), oddBitsVec);
                     __m512i distVec = _mm512_popcnt_epi64(mismatchesVec);
 
-                    uint64_t mismatchesArr[8];
-                    uint64_t distArr[8];
+                    alignas(64) uint64_t mismatchesArr[8];
+                    alignas(64) uint64_t distArr[8];
 
-                    _mm512_storeu_si512((__m512i *)mismatchesArr, mismatchesVec);
-                    _mm512_storeu_si512((__m512i *)distArr, distVec);
+                    _mm512_store_si512((__m512i *)mismatchesArr, mismatchesVec);
+                    _mm512_store_si512((__m512i *)distArr, distVec);
 
                     for (int lane = 0; lane < 8; lane++) {
                         uint64_t dist = distArr[lane];
                         uint64_t mismatches = mismatchesArr[lane];
 
+                        uint64_t offTargetSignature = sigOffset[j + lane];
                         uint64_t idOccVal = idOccOffset[j + lane];
                         uint64_t signatureId = idOccVal & 0xFFFFFFFFULL;
                         uint32_t occurrences = (uint32_t)(idOccVal >> 32);
-                        uint64_t offTargetSignature = offtargets[signatureId];
 
                         if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
 
@@ -464,10 +468,10 @@ int main(int argc, char** argv)
                 }
                 // Clean-up loop
                 for (; j < signaturesInSlice && checkNextOfftargets; j++) {
+                    uint64_t offTargetSignature = sigOffset[j];
                     uint64_t idOccVal = idOccOffset[j];
                     uint64_t signatureId = idOccVal & 0xFFFFFFFFULL;
                     uint32_t occurrences = (uint32_t)(idOccVal >> 32);
-                    uint64_t offTargetSignature = offtargets[signatureId];
 
                     if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
 

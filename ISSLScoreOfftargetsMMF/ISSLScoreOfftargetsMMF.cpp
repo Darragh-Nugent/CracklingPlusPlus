@@ -215,13 +215,14 @@ int main(int argc, char** argv)
 
     /** Begin reading the binary encoded ISSL, structured as:
      *  - The header (3 items)
-     *  - All binary-encoded off-target sites
      *  - Slice masks
      *  - Size of slice 1 lists
-     *  - Contents of slice 1 lists
+     *  - Off-target signatures of slice 1 lists
+     *  - Id/occurrences of slice 1 lists
      *  ...
      *  - Size of slice N lists (N being the number of slices)
-     *  - Contents of slice N lists
+     *  - Off-target signatures of slice N lists
+     *  - Id/occurrences of slice N lists
      */
     mapped_file_source isslFp;
     isslFp.open(argv[1]);
@@ -242,11 +243,8 @@ int main(int argc, char** argv)
     size_t seqLength = *headerPtr++;
     size_t sliceCount = *headerPtr++;
 
-    /** Load in all of the off-target sites */
-    const uint64_t* offtargetsPtr = static_cast<const uint64_t*>(headerPtr);
-
     /** Read the slice masks and generate 2 bit masks */
-    const uint64_t* sliceMasksPtr = static_cast<const uint64_t*>(offtargetsPtr + offtargetsCount);
+    const uint64_t* sliceMasksPtr = static_cast<const uint64_t*>(headerPtr);
     vector<vector<uint64_t>> sliceMasks;
     for (size_t i = 0; i < sliceCount; i++)
     {
@@ -265,18 +263,21 @@ int main(int argc, char** argv)
     /** The contents of the slices. Stored by slice
     * Contains:
     *   - Size of each list within the slice stored contiguously
-    *   - The contents of all the lists stored contiguously
+    *   - The off-target signatures of all the lists stored contiguously
+    *   - The id/occurrences of all the lists stored contiguously
     */
     vector<const size_t*> allSlicelistSizes(sliceCount);
+    vector<const uint64_t*> allSliceSignatures(sliceCount);
     vector<const uint64_t*> allSliceIdOccurrences(sliceCount);
     const size_t* listSizePtr = static_cast<const size_t*>(sliceMasksPtr);
-    const uint64_t* idOccPtr = static_cast<const uint64_t*>(sliceMasksPtr);
     for (size_t i = 0; i < sliceCount; i++)
     {
         allSlicelistSizes[i] = listSizePtr;
-        idOccPtr = static_cast<const uint64_t*>(listSizePtr + (1ULL << (sliceMasks[i].size() * 2)));
+        const uint64_t* signaturePtr = static_cast<const uint64_t*>(static_cast<const void*>(listSizePtr + (1ULL << (sliceMasks[i].size() * 2))));
+        allSliceSignatures[i] = signaturePtr;
+        const uint64_t* idOccPtr = signaturePtr + offtargetsCount;
         allSliceIdOccurrences[i] = idOccPtr;
-        listSizePtr = static_cast<const size_t*>(idOccPtr + offtargetsCount);
+        listSizePtr = static_cast<const size_t*>(static_cast<const void*>(idOccPtr + offtargetsCount));
     }
 
     /** Prevent assessing an off-target site for multiple slices
@@ -306,19 +307,24 @@ int main(int argc, char** argv)
      *         | ...
      */
 
+    vector<vector<const uint64_t*>> sliceListsSig(sliceCount);
     vector<vector<const uint64_t*>> sliceListsIdOcc(sliceCount);
     // Assign sliceLists size based on each slice length
     for (size_t i = 0; i < sliceCount; i++)
     {
+        sliceListsSig[i] = vector<const uint64_t*>(1ULL << (sliceMasks[i].size() * 2));
         sliceListsIdOcc[i] = vector<const uint64_t*>(1ULL << (sliceMasks[i].size() * 2));
     }
 
     for (size_t i = 0; i < sliceCount; i++) {
-        const uint64_t* sliceList = allSliceIdOccurrences[i];
+        const uint64_t* sigList = allSliceSignatures[i];
+        const uint64_t* idOccList = allSliceIdOccurrences[i];
         size_t sliceLimit = 1ULL << (sliceMasks[i].size() * 2);
         for (size_t j = 0; j < sliceLimit; j++) {
-            sliceListsIdOcc[i][j] = sliceList;
-            sliceList += allSlicelistSizes[i][j];
+            sliceListsSig[i][j] = sigList;
+            sliceListsIdOcc[i][j] = idOccList;
+            sigList += allSlicelistSizes[i][j];
+            idOccList += allSlicelistSizes[i][j];
         }
     }
 
@@ -395,17 +401,19 @@ int main(int argc, char** argv)
                 size_t idx = sliceLimitOffset + searchSlice;
 
                 size_t signaturesInSlice = allSlicelistSizes[i][searchSlice];
+                const uint64_t* sigOffset = sliceListsSig[i][searchSlice];
                 const uint64_t* idOccOffset = sliceListsIdOcc[i][searchSlice];
 
                 /** For each off-target signature in slice */
                 size_t j = 0;
                 for (; j + 8 <= signaturesInSlice; j += 8) {
+                    _mm_prefetch((const char*)&sigOffset[j + 8], _MM_HINT_T0);
                     _mm_prefetch((const char*)&idOccOffset[j + 8], _MM_HINT_T0);
 
+                    __m512i offTargetsVec = _mm512_loadu_si512((__m512i*)&sigOffset[j]);
                     __m512i idOccVec = _mm512_loadu_si512((__m512i*)&idOccOffset[j]);
                     __m512i signatureIdVec = _mm512_and_si512(idOccVec, _mm512_set1_epi64(0xFFFFFFFFULL));
                     __m512i occurencesVec = _mm512_srli_epi64(idOccVec, 32);
-                    __m512i offTargetsVec = _mm512_i64gather_epi64(signatureIdVec, (const long long*)offtargetsPtr, 8);
 
                     __m512i xoredSignaturesVec = _mm512_xor_si512(searchSignatureVec, offTargetsVec);
                     __m512i evenBitsVec = _mm512_and_si512(xoredSignaturesVec, _mm512_set1_epi64(0xAAAAAAAAAAAAAAAAULL));
@@ -413,20 +421,20 @@ int main(int argc, char** argv)
                     __m512i mismatchesVec = _mm512_or_si512(_mm512_srli_epi64(evenBitsVec, 1), oddBitsVec);
                     __m512i distVec = _mm512_popcnt_epi64(mismatchesVec);
 
-                    alignas(64) uint64_t mismatchesArr[8];
-                    alignas(64) uint64_t distArr[8];
+                    uint64_t mismatchesArr[8];
+                    uint64_t distArr[8];
 
-                    _mm512_store_si512((__m512i *)mismatchesArr, mismatchesVec);
-                    _mm512_store_si512((__m512i *)distArr, distVec);
+                    _mm512_storeu_si512((__m512i *)mismatchesArr, mismatchesVec);
+                    _mm512_storeu_si512((__m512i *)distArr, distVec);
 
                     for (int lane = 0; lane < 8; lane++) {
                         uint64_t dist = distArr[lane];
                         uint64_t mismatches = mismatchesArr[lane];
 
+                        uint64_t offTargetSignature = sigOffset[j + lane];
                         uint64_t idOccVal = idOccOffset[j + lane];
                         uint64_t signatureId = idOccVal & 0xFFFFFFFFULL;
                         uint32_t occurrences = (uint32_t)(idOccVal >> 32);
-                        uint64_t offTargetSignature = offtargetsPtr[signatureId];
 
                         if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
 
@@ -437,10 +445,10 @@ int main(int argc, char** argv)
                 }
                 // Clean-up loop
                 for (; j < signaturesInSlice && checkNextOfftargets; j++) {
+                    uint64_t offTargetSignature = sigOffset[j];
                     uint64_t idOccVal = idOccOffset[j];
                     uint64_t signatureId = idOccVal & 0xFFFFFFFFULL;
                     uint32_t occurrences = (uint32_t)(idOccVal >> 32);
-                    uint64_t offTargetSignature = offtargetsPtr[signatureId];
 
                     if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
 
