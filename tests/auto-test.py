@@ -11,20 +11,20 @@ sequence_length = "20"
 max_distance = "4"
 threshold = "0"
 score_method = "mit"
-count_of_guides = [10000]
+count_of_guides = [1000000]
 
 SCRIPT_DIR = Path(__file__).parent
 
 test_genomes_dir = SCRIPT_DIR / "test_genomes"
 RESULTS_FILE = SCRIPT_DIR / "results.txt"
 
-off_target_scoring_binary = (SCRIPT_DIR / "../build/ISSLScoreOfftargets/ISSLScoreOfftargets").resolve()
+off_target_scoring_binary = (SCRIPT_DIR / "../build/ISSLScoreOfftargetsMMF/ISSLScoreOfftargetsMMF").resolve()
 extract_off_targets_binary = (SCRIPT_DIR / "../build/ExtractOfftargets/ExtractOfftargets").resolve()
 issl_create_index_binary = (SCRIPT_DIR / "../build/ISSLCreateIndex/ISSLCreateIndex").resolve()
 slice_config_path = (SCRIPT_DIR / f"../sample/{slice_config}.txt")
 
 def score_off_targets(genome_folder: Path, guides: Path, number_of_guides: int | None) -> float:
-    issl_index = "issl.index"
+    issl_index = "index.issl"
     guide_count = number_of_guides if number_of_guides is not None else "UNKNOWN"
     print(f"Scoring {genome_folder.name} against {guide_count} guides...")
     start = time.perf_counter()
