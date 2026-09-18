@@ -281,6 +281,43 @@ double predictMITLocalScore(uint64_t xoredSignatures)
     return calcMITLocalScore(mismatch_array.data(), m);
 }
 
+void LEB128Encode(uint64_t value, vector<uint8_t>& buffer)
+{
+    do {
+        uint8_t byte = value & 0x7f;
+        value >>= 7;
+        if (value != 0 ) {
+            byte |= 0x80;
+
+        }
+        buffer.push_back(byte);
+    } while (value != 0);
+}
+
+vector<uint8_t> deltaEncode(uint64_t value, vector<uint64_t> &prevValues, uint32_t sliceVal, vector<bool> &hasEntry)
+{
+    uint64_t deltaSignatureId = hasEntry[sliceVal]
+    ? value - prevValues[sliceVal]
+    : value;
+
+    hasEntry[sliceVal] = true;
+    prevValues[sliceVal] = value;
+
+    vector<uint8_t> buffer;
+    LEB128Encode(deltaSignatureId, buffer);
+
+    return buffer;
+}
+
+vector<uint8_t> write40BitValue(uint64_t value) {
+    vector<uint8_t> buffer;
+    buffer.reserve(5);
+    for (int b = 0; b < 5; b++) {
+        buffer.push_back(static_cast<uint8_t>((value >> (b * 8)) & 0xFF));
+    }
+    return buffer;
+}
+
 int main(int argc, char** argv)
 {
     // Check number of args
@@ -371,16 +408,6 @@ int main(int argc, char** argv)
 
     uint64_t globalCount = 0;
     uint64_t offtargetsCount = 0;
-    // vector<uint64_t> seqSignatures;
-    // vector<uint32_t> seqSignaturesOccurrences;
-
-    // Read off targets into memory
-    // Does not work for extremely large files
-    // ifstream otInFile;
-    // otInFile.open(argv[1], std::ios::in | std::ios::binary);
-    // vector<char> entireDataSet(otFileSize);
-    // otInFile.read(entireDataSet.data(), otFileSize);
-    // otInFile.close();
 
     boost::iostreams::mapped_file_source entireDataSet;
     entireDataSet.open(argv[1]);
@@ -434,7 +461,28 @@ int main(int argc, char** argv)
     std::cout << "Finished!" << std::endl;
 
     std::cout << "Writing offtargets to file..." << std::endl;
-    isslIndex.write(seqSignatures.data(), seqSignatures.size());
+    for (size_t i = 0; i < sliceMasks.size(); i++)
+    {
+        for (uint64_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++)
+        {
+            const uint64_t* signature = reinterpret_cast<const uint64_t*>(seqSignatures.data()) + signatureId;
+            vector<uint8_t> encoded40BitSignature = write40BitValue(*signature);
+            isslIndex.write(reinterpret_cast<char*>(encoded40BitSignature.data()), encoded40BitSignature.size());
+        }
+    }
+    std::cout << "Finished!" << std::endl;
+
+    std::cout << "Writing occurences to file..." << std::endl;
+    for (size_t i = 0; i < sliceMasks.size(); i++)
+    {
+        for (uint64_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++)
+        {
+            const uint32_t* occurrences = reinterpret_cast<const uint32_t*>(seqSignaturesOccurrences.data()) + signatureId;
+            vector<uint8_t> LEB128Occurance;
+            LEB128Encode(*occurrences, LEB128Occurance);
+            isslIndex.write(reinterpret_cast<char*>(LEB128Occurance.data()), LEB128Occurance.size());
+        }
+    }
     std::cout << "Finished!" << std::endl;
 
     std::cout << "Writing slice masks to file..." << std::endl;
@@ -451,20 +499,20 @@ int main(int argc, char** argv)
     {
         std::cout << fmt::format("\tBuilding slice list {}", i+1) << std::endl;
         size_t sliceListSize = 1ULL << (sliceMasks[i].size() * 2);
-        vector<vector<uint64_t>> sliceList(sliceListSize);
+        vector<vector<uint8_t>> sliceList(sliceListSize);
+        vector<uint32_t> sliceListSizes(sliceListSize, 0);
+        vector<uint64_t> prevSignatureIds(sliceListSize, 0);
+        vector<bool> bucketHasSignatreID(sliceListSize, false);
         for (uint32_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++) {
             const uint64_t* signature = reinterpret_cast<const uint64_t*>(seqSignatures.data()) + signatureId;
-            const uint32_t* occurrences = reinterpret_cast<const uint32_t*>(seqSignaturesOccurrences.data()) + signatureId;
             uint32_t sliceVal = 0ULL;
             for (size_t j = 0; j < sliceMasks[i].size(); j++)
             {
                 sliceVal |= ((*signature >> (sliceMasks[i][j] * 2)) & 3ULL) << (j * 2);
             }
-            // seqSigIdVal represnets the sequence signature ID and number of occurrences of the associated sequence.
-            // (((uint64_t)occurrences) << 32), the most significant 32 bits is the count of the occurrences.
-            // (uint64_t)signatureId, the index of the sequence in `seqSignatures`
-            uint64_t seqSigIdVal = (static_cast<uint64_t>(*occurrences) << 32) | static_cast<uint64_t>(signatureId);
-            sliceList[sliceVal].push_back(seqSigIdVal);
+            vector<uint8_t> LEB128DeltaSignatureId = deltaEncode(static_cast<uint64_t>(signatureId), prevSignatureIds, sliceVal, bucketHasSignatreID);
+            sliceList[sliceVal].insert(sliceList[sliceVal].end(), LEB128DeltaSignatureId.begin(), LEB128DeltaSignatureId.end());
+            sliceListSizes[sliceVal]++;
         }
         std::cout << "\tFinished!" << std::endl;
 
@@ -472,9 +520,18 @@ int main(int argc, char** argv)
         isslIndex.open(argv[4], std::ios::out | std::ios::binary | std::ios::app);
         // Write slice list lengths
         for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
-            size_t sz = sliceList[j].size();
+            size_t sz = sliceListSizes[j];
             isslIndex.write(reinterpret_cast<char*>(&sz), sizeof(size_t));
         }
+        // Write slice list byte counts
+        size_t totalSliceLength = 0;
+        for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
+            size_t sz = sliceList[j].size();
+            totalSliceLength += sz;
+            isslIndex.write(reinterpret_cast<char*>(&sz), sizeof(size_t));
+        }
+        // Write total slice list byte length
+        isslIndex.write(reinterpret_cast<char*>(&totalSliceLength), sizeof(size_t));
         // write slice list data
         for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
             isslIndex.write(reinterpret_cast<char*>(sliceList[j].data()), sizeof(uint64_t) * sliceList[j].size());
