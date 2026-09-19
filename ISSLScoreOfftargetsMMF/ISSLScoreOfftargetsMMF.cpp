@@ -199,7 +199,7 @@ int main(int argc, char** argv)
 
     /** The threshold used to exit scoring early */
     double threshold = atof(argv[4]);
-    double maximum_sum = (10000.0 - threshold * 100) / threshold;
+    maximum_sum = (10000.0 - threshold * 100) / threshold;
 
     /** Scoring methods. To exit early:
      *      - only CFD must drop below `threshold`
