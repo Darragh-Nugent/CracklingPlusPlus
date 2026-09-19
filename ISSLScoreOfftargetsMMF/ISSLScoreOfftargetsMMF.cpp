@@ -13,6 +13,12 @@ const vector<uint8_t> nucleotideIndex{ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 // Binary to char encoding
 const vector<char> signatureIndex{ 'A', 'C', 'G', 'T' };
 
+// Scoring methods
+otScoreMethod scoreMethod;
+bool calcCfd = false;
+bool calcMit = false;
+double maximum_sum;
+
 uint64_t sequenceToSignature(const std::string& seq, uint64_t seqLen)
 {
     uint64_t signature = 0;
@@ -31,6 +37,154 @@ string signatureToSequence(uint64_t sig, uint64_t seqLen)
     return sequence;
 }
 
+void accumulate_scores(double& totScoreMit, double& totScoreCfd, bool& checkNextOfftargets, uint64_t mismatches, uint64_t dist, uint64_t occurrences, uint64_t searchSignature, uint64_t offTargetSignature) {
+    if (dist >= 0 && dist <= 4) {
+        // Begin calculating MIT score
+        if (calcMit) {
+            if (dist > 0) {
+                totScoreMit += precalculatedMITScores.at(mismatches) * (double)occurrences;
+            }
+        }
+
+        // Begin calculating CFD score
+        if (calcCfd) {
+            /** "In other words, for the CFD score, a value of 0
+                *      indicates no predicted off-target activity whereas
+                *      a value of 1 indicates a perfect match"
+                *      John Doench, 2016.
+                *      https://www.nature.com/articles/nbt.3437
+            */
+            double cfdScore = 0;
+            if (dist == 0) {
+                cfdScore = 1;
+            }
+            else {
+                cfdScore = cfdPamPenalties[0b1010]; // PAM: NGG, TODO: do not hard-code the PAM
+
+                for (size_t pos = 0; pos < 20; pos++) {
+                    size_t mask = pos << 4;
+
+                    /** Create the mask to look up the position-identity score
+                        *      In Python... c2b is char to bit
+                        *       mask = pos << 4
+                        *       mask |= c2b[sgRNA[pos]] << 2
+                        *       mask |= c2b[revcom(offTaret[pos])]
+                        *
+                        *      Find identity at `pos` for search signature
+                        *      example: find identity in pos=2
+                        *       Recall ISSL is inverted, hence:
+                        *                   3'-  T  G  C  C  G  A -5'
+                        *       start           11 10 01 01 10 00
+                        *       3UL << pos*2    00 00 00 11 00 00
+                        *       and             00 00 00 01 00 00
+                        *       shift           00 00 00 00 01 00
+                        */
+                    uint64_t searchSigIdentityPos = searchSignature;
+                    searchSigIdentityPos &= (3ULL << (pos * 2));
+                    searchSigIdentityPos = searchSigIdentityPos >> (pos * 2);
+                    searchSigIdentityPos = searchSigIdentityPos << 2;
+
+                    /** Find identity at `pos` for offtarget
+                        *      Example: find identity in pos=2
+                        *      Recall ISSL is inverted, hence:
+                        *                  3'-  T  G  C  C  G  A -5'
+                        *      start           11 10 01 01 10 00
+                        *      3UL<<pos*2      00 00 00 11 00 00
+                        *      and             00 00 00 01 00 00
+                        *      shift           00 00 00 00 00 01
+                        *      rev comp 3UL    00 00 00 00 00 10 (done below)
+                        */
+                    uint64_t offtargetIdentityPos = offTargetSignature;
+                    offtargetIdentityPos &= (3ULL << (pos * 2));
+                    offtargetIdentityPos = offtargetIdentityPos >> (pos * 2);
+
+                    /** Complete the mask
+                        *      reverse complement (^3UL) `offtargetIdentityPos` here
+                        */
+                    mask = (mask | searchSigIdentityPos | (offtargetIdentityPos ^ 3UL));
+
+                    if (searchSigIdentityPos >> 2 != offtargetIdentityPos) {
+                        cfdScore *= cfdPosPenalties[mask];
+                    }
+                }
+            }
+            totScoreCfd += cfdScore * (double)occurrences;
+        }
+
+        /** Stop calculating global score early if possible */
+        if (scoreMethod == otScoreMethod::mitAndCfd) {
+            if (totScoreMit > maximum_sum && totScoreCfd > maximum_sum) {
+                checkNextOfftargets = false;
+                return;
+            }
+        }
+        if (scoreMethod == otScoreMethod::mitOrCfd) {
+            if (totScoreMit > maximum_sum || totScoreCfd > maximum_sum) {
+                checkNextOfftargets = false;
+                return;
+            }
+        }
+        if (scoreMethod == otScoreMethod::avgMitCfd) {
+            if (((totScoreMit + totScoreCfd) / 2.0) > maximum_sum) {
+                checkNextOfftargets = false;
+                return;
+            }
+        }
+        if (scoreMethod == otScoreMethod::mit) {
+            if (totScoreMit > maximum_sum) {
+                checkNextOfftargets = false;
+                return;
+            }
+        }
+        if (scoreMethod == otScoreMethod::cfd) {
+            if (totScoreCfd > maximum_sum) {
+                checkNextOfftargets = false;
+                return;
+            }
+        }
+    }
+}
+
+bool seenOfftargetAlready(uint64_t* offtargetTogglesTail, uint64_t signatureId) {
+    /** Prevent assessing the same off-target for multiple slices */
+    uint64_t seen = 0;
+    uint64_t* ptrOfftargetFlag = (offtargetTogglesTail - (signatureId / 64));
+    seen = (*ptrOfftargetFlag >> (signatureId % 64)) & 1ULL;
+
+    if (!seen) {
+        /** Mark the current off-target as seen for this slice **/
+        *ptrOfftargetFlag |= (1ULL << (signatureId % 64));
+    }
+
+    return seen;
+}
+
+uint64_t LEB128Decode(const uint8_t *ptr, uint32_t &bytesUsed)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    uint8_t byte = 0;
+    bytesUsed = 0;
+
+    do
+    {
+        byte = ptr[bytesUsed];
+        result |= static_cast<uint64_t>(byte & 0x7F) << shift;
+        shift += 7;
+        bytesUsed++;
+    } while (byte & 0x80);
+
+    return result;
+}
+
+uint64_t read40BitValue(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int b = 0; b < 5; b++)
+        v |= static_cast<uint64_t>(p[b]) << (b * 8);
+    return v;
+}
+
 int main(int argc, char** argv)
 {
     auto startLoading = std::chrono::high_resolution_clock::now();
@@ -45,6 +199,7 @@ int main(int argc, char** argv)
 
     /** The threshold used to exit scoring early */
     double threshold = atof(argv[4]);
+    double maximum_sum = (10000.0 - threshold * 100) / threshold;
 
     /** Scoring methods. To exit early:
      *      - only CFD must drop below `threshold`
@@ -54,9 +209,6 @@ int main(int argc, char** argv)
      *      - the average of CFD and MIT must below `threshold`
      */
     string argScoreMethod = argv[5];
-    otScoreMethod scoreMethod;
-    bool calcCfd = false;
-    bool calcMit = false;
     if (!argScoreMethod.compare("and")) {
         scoreMethod = otScoreMethod::mitAndCfd;
         calcCfd = true;
@@ -116,10 +268,11 @@ int main(int argc, char** argv)
     size_t sliceCount = *headerPtr++;
 
     /** Load in all of the off-target sites */
-    const uint64_t* offtargetsPtr = static_cast<const uint64_t*>(headerPtr);
+    const uint8_t* offtargetsPtr = reinterpret_cast<const uint8_t*>(headerPtr);
+    const uint32_t* occurrencesPtr = reinterpret_cast<const uint32_t*>(offtargetsPtr + offtargetsCount * 5);
 
     /** Read the slice masks and generate 2 bit masks */
-    const uint64_t* sliceMasksPtr = static_cast<const uint64_t*>(offtargetsPtr + offtargetsCount);
+    const uint64_t* sliceMasksPtr = reinterpret_cast<const uint64_t*>(occurrencesPtr + offtargetsCount);
     vector<vector<uint64_t>> sliceMasks;
     for (size_t i = 0; i < sliceCount; i++)
     {
@@ -135,24 +288,33 @@ int main(int argc, char** argv)
         sliceMasksPtr++;
     }
 
+    /** Read the total byte length of the signature Ids */
+    // const uint64_t* totalByteLengthPtr = sliceMasksPtr + 1;
+
     /** The contents of the slices. Stored by slice
     * Contains:
     *   - Size of each list within the slice stored contiguously
     *   - The contents of all the lists stored contiguously
     */
     vector<const size_t*> allSlicelistSizes(sliceCount);
-    vector<const uint64_t*> allSliceSignatures(sliceCount);
+    vector<const size_t*> allSliceListByteCounts(sliceCount);
+    vector<size_t> allTotalSliceListByteCounts(sliceCount);
+    vector<const uint8_t*> allSliceSignatures(sliceCount);
     const size_t* listSizePtr = static_cast<const size_t*>(sliceMasksPtr);
-    const uint64_t* signaturePtr = static_cast<const uint64_t*>(sliceMasksPtr);
+    const size_t* byteCountPtr = static_cast<const size_t*>(sliceMasksPtr);
+    const size_t* totalByteCountPtr = static_cast<const size_t*>(sliceMasksPtr);
+    const uint8_t* signaturePtr = reinterpret_cast<const uint8_t*>(sliceMasksPtr);
     for (size_t i = 0; i < sliceCount; i++)
     {
         allSlicelistSizes[i] = listSizePtr;
-        signaturePtr = static_cast<const uint64_t*>(listSizePtr + (1ULL << (sliceMasks[i].size() * 2)));
+        byteCountPtr = static_cast<const uint64_t*>(listSizePtr + (1ULL << (sliceMasks[i].size() * 2)));
+        allSliceListByteCounts[i] = byteCountPtr;
+        totalByteCountPtr = static_cast<const uint64_t*>(byteCountPtr + (1ULL << (sliceMasks[i].size() * 2)));
+        allTotalSliceListByteCounts[i] = *totalByteCountPtr;
+        signaturePtr = reinterpret_cast<const uint8_t*>(totalByteCountPtr + 1);
         allSliceSignatures[i] = signaturePtr;
-        listSizePtr = static_cast<const size_t*>(signaturePtr + offtargetsCount);
+        listSizePtr = reinterpret_cast<const size_t*>(signaturePtr + allTotalSliceListByteCounts[i]);
     }
-
-
 
 
     /** Prevent assessing an off-target site for multiple slices
@@ -182,19 +344,19 @@ int main(int argc, char** argv)
      *         | ...
      */
 
-    vector<vector<const uint64_t*>> sliceLists(sliceCount);
+    vector<vector<const uint8_t*>> sliceLists(sliceCount);
     // Assign sliceLists size based on each slice length
     for (size_t i = 0; i < sliceCount; i++)
     {
-        sliceLists[i] = vector<const uint64_t*>(1ULL << (sliceMasks[i].size() * 2));
+        sliceLists[i] = vector<const uint8_t*>(1ULL << (sliceMasks[i].size() * 2));
     }
 
     for (size_t i = 0; i < sliceCount; i++) {
-        const uint64_t* sliceList = allSliceSignatures[i];
+        const uint8_t* sliceList = allSliceSignatures[i];
         size_t sliceLimit = 1ULL << (sliceMasks[i].size() * 2);
         for (size_t j = 0; j < sliceLimit; j++) {
             sliceLists[i][j] = sliceList;
-            sliceList += allSlicelistSizes[i][j];
+            sliceList += allSliceListByteCounts[i][j];
         }
     }
 
@@ -239,6 +401,7 @@ int main(int argc, char** argv)
     }
 
     /** Begin scoring */
+    /** Begin scoring */
     #pragma omp parallel
     {
         vector<uint64_t> offtargetToggles(numOfftargetToggles);
@@ -249,19 +412,18 @@ int main(int argc, char** argv)
         for (int searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
 
             auto searchSignature = querySignatures[searchIdx];
+            __m512i searchSignatureVec = _mm512_set1_epi64((int64_t)searchSignature);
 
             /** Global scores */
             double totScoreMit = 0.0;
             double totScoreCfd = 0.0;
 
-            double maximum_sum = (10000.0 - threshold * 100) / threshold;
-            bool checkNextSlice = true;
+            bool checkNextOfftargets = true;
 
             size_t sliceLimitOffset = 0;
             /** For each ISSL slice */
             for (size_t i = 0; i < sliceCount; i++) {
                 vector<uint64_t>& sliceMask = sliceMasks[i];
-                auto& sliceList = sliceLists[i];
 
                 uint64_t searchSlice = 0ULL;
                 for (int j = 0; j < sliceMask.size(); j++)
@@ -271,164 +433,106 @@ int main(int argc, char** argv)
 
                 size_t idx = sliceLimitOffset + searchSlice;
 
-                size_t signaturesInSlice = allSlicelistSizes[i][searchSlice];
-                const uint64_t* sliceOffset = sliceList[searchSlice];
+                size_t signaturesInSlice;
+                const uint8_t* p = nullptr;
+                uint64_t prevSignatureId = 0;
+
+                // uint8_t* sigOffset = nullptr;
+                const uint8_t* idOffset = nullptr;
+
+                signaturesInSlice = allSlicelistSizes[i][searchSlice];
+                // sigOffset = sliceListsSig[i][searchSlice];
+                idOffset = sliceLists[i][searchSlice];
+
+                p = idOffset;
+
+                alignas(64) uint64_t sigBuf[8], idBuf[8], occBuf[8];
 
                 /** For each off-target signature in slice */
-                for (size_t j = 0; j < signaturesInSlice; j++) {
-                    auto signatureWithOccurrencesAndId = sliceOffset[j];
-                    auto signatureId = signatureWithOccurrencesAndId & 0xFFFFFFFFULL;
-                    uint32_t occurrences = (signatureWithOccurrencesAndId >> (32));
+                size_t j = 0;
+                for (; j + 8 <= signaturesInSlice; j += 8) {
+                    __m512i offTargetsVec;
+                    __m512i signatureIdVec;
+                    __m512i occurencesVec;
 
-                    /** Prevent assessing the same off-target for multiple slices */
-                    uint64_t seenOfftargetAlready = 0;
-                    uint64_t* ptrOfftargetFlag = (offtargetTogglesTail - (signatureId / 64));
-                    seenOfftargetAlready = (*ptrOfftargetFlag >> (signatureId % 64)) & 1ULL;
+                    for (int lane = 0; lane < 8; lane++)
+                    {
+                        uint32_t bytesUsed = 0;
+                        uint64_t deltaId = LEB128Decode(p, bytesUsed);
+                        p += bytesUsed;
+                        prevSignatureId += deltaId;
+                        uint64_t signatureId = prevSignatureId;
+                        idBuf[lane] = signatureId;
 
-                    if (!seenOfftargetAlready) {
-                        *ptrOfftargetFlag |= (1ULL << (signatureId % 64));
-
-                        /** Find the positions of mismatches
-                            *
-                            *  Search signature (SS):    A  A  T  T    G  C  A  T
-                            *                           00 00 11 11   10 01 00 11
-                            *
-                            *        Off-target (OT):    A  T  A  T    C  G  A  T
-                            *                           00 11 00 11   01 10 00 11
-                            *
-                            *                SS ^ OT:   00 00 11 11   10 01 00 11
-                            *                         ^ 00 11 00 11   01 10 00 11
-                            *                  (XORd) = 00 11 11 00   11 11 00 00
-                            *
-                            *        XORd & evenBits:   00 11 11 00   11 11 00 00
-                            *                         & 10 10 10 10   10 10 10 10
-                            *                   (eX)  = 00 10 10 00   10 10 00 00
-                            *
-                            *         XORd & oddBits:   00 11 11 00   11 11 00 00
-                            *                         & 01 01 01 01   01 01 01 01
-                            *                   (oX)  = 00 01 01 00   01 01 00 00
-                            *
-                            *         (eX >> 1) | oX:   00 01 01 00   01 01 00 00 (>>1)
-                            *                         | 00 01 01 00   01 01 00 00
-                            *            mismatches   = 00 01 01 00   01 01 00 00
-                            *
-                            *   popcount(mismatches):   4
-                            */
-                        uint64_t xoredSignatures = searchSignature ^ offtargetsPtr[signatureId];
-                        uint64_t evenBits = xoredSignatures & 0xAAAAAAAAAAAAAAAAULL;
-                        uint64_t oddBits = xoredSignatures & 0x5555555555555555ULL;
-                        uint64_t mismatches = (evenBits >> 1) | oddBits;
-                        uint64_t dist = popcount64(mismatches);
-
-                        if (dist >= 0 && dist <= 4) {
-                            // Begin calculating MIT score
-                            if (calcMit) {
-                                if (dist > 0) {
-                                    totScoreMit += precalculatedMITScores.at(mismatches) * (double)occurrences;
-                                }
-                            }
-
-                            // Begin calculating CFD score
-                            if (calcCfd) {
-                                /** "In other words, for the CFD score, a value of 0
-                                    *      indicates no predicted off-target activity whereas
-                                    *      a value of 1 indicates a perfect match"
-                                    *      John Doench, 2016.
-                                    *      https://www.nature.com/articles/nbt.3437
-                                */
-                                double cfdScore = 0;
-                                if (dist == 0) {
-                                    cfdScore = 1;
-                                }
-                                else {
-                                    cfdScore = cfdPamPenalties[0b1010]; // PAM: NGG, TODO: do not hard-code the PAM
-
-                                    for (size_t pos = 0; pos < 20; pos++) {
-                                        size_t mask = pos << 4;
-
-                                        /** Create the mask to look up the position-identity score
-                                            *      In Python... c2b is char to bit
-                                            *       mask = pos << 4
-                                            *       mask |= c2b[sgRNA[pos]] << 2
-                                            *       mask |= c2b[revcom(offTaret[pos])]
-                                            *
-                                            *      Find identity at `pos` for search signature
-                                            *      example: find identity in pos=2
-                                            *       Recall ISSL is inverted, hence:
-                                            *                   3'-  T  G  C  C  G  A -5'
-                                            *       start           11 10 01 01 10 00
-                                            *       3UL << pos*2    00 00 00 11 00 00
-                                            *       and             00 00 00 01 00 00
-                                            *       shift           00 00 00 00 01 00
-                                            */
-                                        uint64_t searchSigIdentityPos = searchSignature;
-                                        searchSigIdentityPos &= (3ULL << (pos * 2));
-                                        searchSigIdentityPos = searchSigIdentityPos >> (pos * 2);
-                                        searchSigIdentityPos = searchSigIdentityPos << 2;
-
-                                        /** Find identity at `pos` for offtarget
-                                            *      Example: find identity in pos=2
-                                            *      Recall ISSL is inverted, hence:
-                                            *                  3'-  T  G  C  C  G  A -5'
-                                            *      start           11 10 01 01 10 00
-                                            *      3UL<<pos*2      00 00 00 11 00 00
-                                            *      and             00 00 00 01 00 00
-                                            *      shift           00 00 00 00 00 01
-                                            *      rev comp 3UL    00 00 00 00 00 10 (done below)
-                                            */
-                                        uint64_t offtargetIdentityPos = offtargetsPtr[signatureId];
-                                        offtargetIdentityPos &= (3ULL << (pos * 2));
-                                        offtargetIdentityPos = offtargetIdentityPos >> (pos * 2);
-
-                                        /** Complete the mask
-                                            *      reverse complement (^3UL) `offtargetIdentityPos` here
-                                            */
-                                        mask = (mask | searchSigIdentityPos | (offtargetIdentityPos ^ 3UL));
-
-                                        if (searchSigIdentityPos >> 2 != offtargetIdentityPos) {
-                                            cfdScore *= cfdPosPenalties[mask];
-                                        }
-                                    }
-                                }
-                                totScoreCfd += cfdScore * (double)occurrences;
-                            }
-
-                            /** Stop calculating global score early if possible */
-                            if (scoreMethod == otScoreMethod::mitAndCfd) {
-                                if (totScoreMit > maximum_sum && totScoreCfd > maximum_sum) {
-                                    checkNextSlice = false;
-                                    break;
-                                }
-                            }
-                            if (scoreMethod == otScoreMethod::mitOrCfd) {
-                                if (totScoreMit > maximum_sum || totScoreCfd > maximum_sum) {
-                                    checkNextSlice = false;
-                                    break;
-                                }
-                            }
-                            if (scoreMethod == otScoreMethod::avgMitCfd) {
-                                if (((totScoreMit + totScoreCfd) / 2.0) > maximum_sum) {
-                                    checkNextSlice = false;
-                                    break;
-                                }
-                            }
-                            if (scoreMethod == otScoreMethod::mit) {
-                                if (totScoreMit > maximum_sum) {
-                                    checkNextSlice = false;
-                                    break;
-                                }
-                            }
-                            if (scoreMethod == otScoreMethod::cfd) {
-                                if (totScoreCfd > maximum_sum) {
-                                    checkNextSlice = false;
-                                    break;
-                                }
-                            }
-                        }
+                        sigBuf[lane] = read40BitValue(offtargetsPtr + signatureId * 5);
+                        occBuf[lane] = occurrencesPtr[signatureId];
                     }
+
+                    offTargetsVec = _mm512_loadu_si512((__m512i*)sigBuf);
+                    signatureIdVec = _mm512_loadu_si512((__m512i*)idBuf);
+                    occurencesVec  = _mm512_loadu_si512((__m512i*)occBuf);
+
+                    __m512i xoredSignaturesVec = _mm512_xor_si512(searchSignatureVec, offTargetsVec);
+                    __m512i evenBitsVec = _mm512_and_si512(xoredSignaturesVec, _mm512_set1_epi64(0xAAAAAAAAAAAAAAAAULL));
+                    __m512i oddBitsVec = _mm512_and_si512(xoredSignaturesVec, _mm512_set1_epi64(0x5555555555555555ULL));
+                    __m512i mismatchesVec = _mm512_or_si512(_mm512_srli_epi64(evenBitsVec, 1), oddBitsVec);
+                    __m512i distVec = _mm512_popcnt_epi64(mismatchesVec);
+
+                    alignas(64) uint64_t mismatchesArr[8];
+                    alignas(64) uint64_t distArr[8];
+                    alignas(64) uint64_t offTargetArr[8];
+                    alignas(64) uint64_t sigIdArr[8];
+                    alignas(64) uint64_t occArr[8];
+
+                    _mm512_store_si512((__m512i *)mismatchesArr, mismatchesVec);
+                    _mm512_store_si512((__m512i *)distArr, distVec);
+
+                    for (int lane = 0; lane < 8; lane++) {
+                        uint64_t dist = distArr[lane];
+                        uint64_t mismatches = mismatchesArr[lane];
+
+                        uint64_t offTargetSignature;
+                        uint64_t signatureId;
+                        uint32_t occurrences;
+
+                        offTargetSignature = sigBuf[lane];
+                        signatureId = idBuf[lane];
+                        occurrences = (uint32_t)occBuf[lane];
+
+                        if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
+
+                        accumulate_scores(totScoreMit, totScoreCfd, checkNextOfftargets, mismatches, dist, occurrences, searchSignature, offTargetSignature);
+                        if (!checkNextOfftargets) break;
+                    }
+                    if (!checkNextOfftargets) break;
                 }
-                if (!checkNextSlice)
-                    break;
+                // Clean-up loop
+                for (; j < signaturesInSlice && checkNextOfftargets; j++) {
+                    uint64_t offTargetSignature;
+                    uint64_t signatureId;
+                    uint32_t occurrences;
+
+                    uint32_t bytesUsed = 0;
+                    uint64_t deltaId = LEB128Decode(p, bytesUsed);
+                    p += bytesUsed;
+                    prevSignatureId += deltaId;
+                    signatureId = prevSignatureId;
+
+                    offTargetSignature = read40BitValue(offtargetsPtr + signatureId * 5);
+                    occurrences = occurrencesPtr[signatureId];
+
+                    if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
+
+                    uint64_t xoredSignatures = searchSignature ^ offTargetSignature;
+                    uint64_t evenBits = xoredSignatures & 0xAAAAAAAAAAAAAAAAULL;
+                    uint64_t oddBits = xoredSignatures & 0x5555555555555555ULL;
+                    uint64_t mismatches = (evenBits >> 1) | oddBits;
+                    uint64_t dist = popcount64(mismatches);
+
+                    accumulate_scores(totScoreMit, totScoreCfd, checkNextOfftargets, mismatches, dist, occurrences, searchSignature, offTargetSignature);
+                    if (!checkNextOfftargets) break;
+                }
+                if (!checkNextOfftargets) break;
                 sliceLimitOffset += 1ULL << (sliceMasks[i].size() * 2);
             }
             querySignatureMitScores[searchIdx] = 10000.0 / (100.0 + totScoreMit);

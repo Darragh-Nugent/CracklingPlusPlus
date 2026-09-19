@@ -461,28 +461,16 @@ int main(int argc, char** argv)
     std::cout << "Finished!" << std::endl;
 
     std::cout << "Writing offtargets to file..." << std::endl;
-    for (size_t i = 0; i < sliceMasks.size(); i++)
+    for (uint64_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++)
     {
-        for (uint64_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++)
-        {
-            const uint64_t* signature = reinterpret_cast<const uint64_t*>(seqSignatures.data()) + signatureId;
-            vector<uint8_t> encoded40BitSignature = write40BitValue(*signature);
-            isslIndex.write(reinterpret_cast<char*>(encoded40BitSignature.data()), encoded40BitSignature.size());
-        }
+        const uint64_t* signature = reinterpret_cast<const uint64_t*>(seqSignatures.data()) + signatureId;
+        vector<uint8_t> encoded40BitSignature = write40BitValue(*signature);
+        isslIndex.write(reinterpret_cast<char*>(encoded40BitSignature.data()), encoded40BitSignature.size());
     }
     std::cout << "Finished!" << std::endl;
 
     std::cout << "Writing occurences to file..." << std::endl;
-    for (size_t i = 0; i < sliceMasks.size(); i++)
-    {
-        for (uint64_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++)
-        {
-            const uint32_t* occurrences = reinterpret_cast<const uint32_t*>(seqSignaturesOccurrences.data()) + signatureId;
-            vector<uint8_t> LEB128Occurance;
-            LEB128Encode(*occurrences, LEB128Occurance);
-            isslIndex.write(reinterpret_cast<char*>(LEB128Occurance.data()), LEB128Occurance.size());
-        }
-    }
+    isslIndex.write(seqSignaturesOccurrences.data(), seqSignaturesOccurrences.size());
     std::cout << "Finished!" << std::endl;
 
     std::cout << "Writing slice masks to file..." << std::endl;
@@ -492,9 +480,14 @@ int main(int argc, char** argv)
     }
     std::cout << "Finished!" << std::endl;
 
+    // std::streampos totalPlaceholderPos = isslIndex.tellp();
+    // // Reserve a spot for the total byte count
+    // const uint64_t placeholder = 0;
+    // isslIndex.write(reinterpret_cast<const char*>(&placeholder), sizeof(placeholder));
     isslIndex.close();
 
     std::cout << "Constructing index..." << std::endl;
+    uint64_t totalByteCount = 0;
     for (size_t i = 0; i < sliceMasks.size(); i++)
     {
         std::cout << fmt::format("\tBuilding slice list {}", i+1) << std::endl;
@@ -532,13 +525,21 @@ int main(int argc, char** argv)
         }
         // Write total slice list byte length
         isslIndex.write(reinterpret_cast<char*>(&totalSliceLength), sizeof(size_t));
+        totalByteCount += totalSliceLength;
         // write slice list data
         for (size_t j = 0; j < sliceListSize; j++) { // Slice limit given slice width
-            isslIndex.write(reinterpret_cast<char*>(sliceList[j].data()), sizeof(uint64_t) * sliceList[j].size());
+            isslIndex.write(reinterpret_cast<char*>(sliceList[j].data()), sliceList[j].size());
         }
         isslIndex.close();
         std::cout << "\tFinished!" << std::endl;
     }
+
+    // std::cout << "Writing total bytes for signature ID and occurrences section..." << std::endl;
+    // isslIndex.open(argv[5], std::ios::in |std::ios::out | std::ios::binary);
+    // isslIndex.seekp(totalPlaceholderPos);
+    // isslIndex.write(reinterpret_cast<char*>(&totalByteCount), sizeof(totalByteCount));
+    // isslIndex.close();
+
     seqSignatures.close();
     seqSignaturesOccurrences.close();
     remove(fmt::format("{}.tmp.1", argv[4]));
