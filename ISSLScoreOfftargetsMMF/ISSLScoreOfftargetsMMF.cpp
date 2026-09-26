@@ -20,7 +20,7 @@ bool calcMit = false;
 double maximum_sum;
 
 struct OverflowEntry {
-    uint32_t signatureId;
+    uint64_t signatureId;
     uint32_t occurrences;
 };
 

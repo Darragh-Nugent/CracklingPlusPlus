@@ -22,7 +22,7 @@ const std::vector<char> signatureIndex{ 'A', 'C', 'G', 'T' };
 uint64_t seqLength;
 
 struct OverflowEntry {
-    uint32_t signatureId;
+    uint64_t signatureId;
     uint32_t occurrences;
 };
 
@@ -478,17 +478,17 @@ int main(int argc, char** argv)
     vector<uint8_t> occByte(seqSignaturesCount);
     vector<OverflowEntry> overflow;
 
-    for (uint64_t i = 0; i < seqSignaturesCount; i++) 
+    for (uint64_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++) 
     {
-        uint32_t occurrence = reinterpret_cast<const uint32_t*>(seqSignaturesOccurrences.data())[i];
+        uint32_t occurrence = reinterpret_cast<const uint32_t*>(seqSignaturesOccurrences.data())[signatureId];
         if (occurrence < 0xFF) 
         {
-            occByte[i] = static_cast<uint8_t>(occurrence);
+            occByte[signatureId] = static_cast<uint8_t>(occurrence);
         } 
         else 
         {
-            occByte[i] = 0xFF;
-            overflow.push_back({static_cast<uint32_t>(i), occurrence});
+            occByte[signatureId] = 0xFF;
+            overflow.push_back({signatureId, occurrence});
         }
     }
     isslIndex.write(reinterpret_cast<char*>(occByte.data()), occByte.size());
@@ -521,7 +521,7 @@ int main(int argc, char** argv)
         vector<uint32_t> sliceListSizes(sliceListSize, 0);
         vector<uint64_t> prevSignatureIds(sliceListSize, 0);
         vector<bool> bucketHasSignatreID(sliceListSize, false);
-        for (uint32_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++) {
+        for (uint64_t signatureId = 0; signatureId < seqSignaturesCount; signatureId++) {
             const uint64_t* signature = reinterpret_cast<const uint64_t*>(seqSignatures.data()) + signatureId;
             uint32_t sliceVal = 0ULL;
             for (size_t j = 0; j < sliceMasks[i].size(); j++)
