@@ -19,6 +19,11 @@ bool calcCfd = false;
 bool calcMit = false;
 double maximum_sum;
 
+struct OverflowEntry {
+    uint32_t signatureId;
+    uint32_t occurrences;
+};
+
 uint64_t sequenceToSignature(const std::string& seq, uint64_t seqLen)
 {
     uint64_t signature = 0;
@@ -185,6 +190,21 @@ uint64_t read40BitValue(const uint8_t *p)
     return v;
 }
 
+uint32_t getOccurrences(uint64_t signatureId, const uint8_t* occBytePtr, const OverflowEntry* overflowPtr, uint64_t overflowCount) {
+    uint8_t b = occBytePtr[signatureId];
+    if (b != 0xFF) return b;
+
+    // binary search overflow table (sorted by signatureId since written in order)
+    size_t lo = 0, hi = overflowCount;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (overflowPtr[mid].signatureId < signatureId) lo = mid + 1;
+        else hi = mid;
+    }
+    return overflowPtr[lo].occurrences; // guaranteed match if data is well-formed
+}
+
+
 int main(int argc, char** argv)
 {
     auto startLoading = std::chrono::high_resolution_clock::now();
@@ -269,10 +289,16 @@ int main(int argc, char** argv)
 
     /** Load in all of the off-target sites */
     const uint8_t* offtargetsPtr = reinterpret_cast<const uint8_t*>(headerPtr);
-    const uint32_t* occurrencesPtr = reinterpret_cast<const uint32_t*>(offtargetsPtr + offtargetsCount * 5);
+
+    /** Load in all the occurrences data */
+    const uint8_t* occBytePtr = reinterpret_cast<const uint8_t*>(offtargetsPtr + offtargetsCount * 5);
+    const uint64_t* overflowCountPtr = reinterpret_cast<const uint64_t*>(occBytePtr + offtargetsCount);
+    uint64_t overflowCount;
+    std::memcpy(&overflowCount, overflowCountPtr, sizeof(uint64_t));
+    const OverflowEntry* overflowPtr = reinterpret_cast<const OverflowEntry*>(overflowCountPtr + 1);
 
     /** Read the slice masks and generate 2 bit masks */
-    const uint64_t* sliceMasksPtr = reinterpret_cast<const uint64_t*>(occurrencesPtr + offtargetsCount);
+    const uint64_t* sliceMasksPtr = reinterpret_cast<const uint64_t*>(overflowPtr + overflowCount);
     vector<vector<uint64_t>> sliceMasks;
     for (size_t i = 0; i < sliceCount; i++)
     {
@@ -465,7 +491,7 @@ int main(int argc, char** argv)
                         idBuf[lane] = signatureId;
 
                         sigBuf[lane] = read40BitValue(offtargetsPtr + signatureId * 5);
-                        occBuf[lane] = occurrencesPtr[signatureId];
+                        occBuf[lane] = getOccurrences(signatureId, occBytePtr, overflowPtr, overflowCount);
                     }
 
                     offTargetsVec = _mm512_loadu_si512((__m512i*)sigBuf);
@@ -519,7 +545,7 @@ int main(int argc, char** argv)
                     signatureId = prevSignatureId;
 
                     offTargetSignature = read40BitValue(offtargetsPtr + signatureId * 5);
-                    occurrences = occurrencesPtr[signatureId];
+                    occurrences = getOccurrences(signatureId, occBytePtr, overflowPtr, overflowCount);
 
                     if (seenOfftargetAlready(offtargetTogglesTail, signatureId)) continue;
 

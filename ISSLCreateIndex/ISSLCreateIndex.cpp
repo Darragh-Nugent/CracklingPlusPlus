@@ -21,6 +21,11 @@ const std::vector<char> signatureIndex{ 'A', 'C', 'G', 'T' };
 // const vector<char> signatureIndex{ '0','A','C','3','G','5','6','T' };
 uint64_t seqLength;
 
+struct OverflowEntry {
+    uint32_t signatureId;
+    uint32_t occurrences;
+};
+
 /**
  * getLineEnding
  *
@@ -470,7 +475,27 @@ int main(int argc, char** argv)
     std::cout << "Finished!" << std::endl;
 
     std::cout << "Writing occurences to file..." << std::endl;
-    isslIndex.write(seqSignaturesOccurrences.data(), seqSignaturesOccurrences.size());
+    vector<uint8_t> occByte(seqSignaturesCount);
+    vector<OverflowEntry> overflow;
+
+    for (uint64_t i = 0; i < seqSignaturesCount; i++) 
+    {
+        uint32_t occurrence = reinterpret_cast<const uint32_t*>(seqSignaturesOccurrences.data())[i];
+        if (occurrence < 0xFF) 
+        {
+            occByte[i] = static_cast<uint8_t>(occurrence);
+        } 
+        else 
+        {
+            occByte[i] = 0xFF;
+            overflow.push_back({static_cast<uint32_t>(i), occurrence});
+        }
+    }
+    isslIndex.write(reinterpret_cast<char*>(occByte.data()), occByte.size());
+
+    uint64_t overflowCount = overflow.size();
+    isslIndex.write(reinterpret_cast<char*>(&overflowCount), sizeof(uint64_t));
+    isslIndex.write(reinterpret_cast<char*>(overflow.data()), overflow.size() * sizeof(OverflowEntry));
     std::cout << "Finished!" << std::endl;
 
     std::cout << "Writing slice masks to file..." << std::endl;
